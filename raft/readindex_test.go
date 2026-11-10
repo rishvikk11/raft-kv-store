@@ -67,7 +67,7 @@ func forcedLeader(t *testing.T, tr Transport) *Node {
 	t.Helper()
 	nd, err := NewNode(Config{
 		ID: 0, ClusterSize: 3, Transport: tr, DataDir: t.TempDir(), DisableFsync: true,
-		Apply: func(int, int, []byte) {}, disableCheckQuorum: true,
+		Apply: func(int, int, []byte) {}, DisableStepDown: true,
 	})
 	if err != nil {
 		t.Fatal(err)

@@ -106,11 +106,12 @@ type Config struct {
 	ElectionTimeoutMax time.Duration // default 600ms
 	HeartbeatInterval  time.Duration // default 75ms
 	DisableFsync       bool          // tests only: skip forcing writes to disk
-	// disableCheckQuorum is for tests only. Step-down is timer-based, so a
-	// leader that is paused or slow can still hold a stale belief for a while.
-	// This switch freezes that moment so a test can examine it deterministically.
-	disableCheckQuorum bool
-	Logf               func(format string, args ...any)
+	// DisableStepDown is for fault-injection tests ONLY. Step-down is
+	// timer-based, so a leader that is paused or slow can still believe it leads
+	// after being replaced. This switch holds the leader in that state so a test
+	// can check that reads and writes stay safe anyway. Never set it in real use.
+	DisableStepDown bool
+	Logf            func(format string, args ...any)
 }
 
 const (
@@ -450,7 +451,7 @@ func (nd *Node) becomeLeaderLocked() {
 // serving. The window matches the earliest moment a follower could start a
 // replacement election, so a cut-off leader quits about when it gets replaced.
 func (nd *Node) checkQuorumLocked() {
-	if nd.n == 1 || nd.cfg.disableCheckQuorum {
+	if nd.n == 1 || nd.cfg.DisableStepDown {
 		return
 	}
 	cutoff := time.Now().Add(-nd.cfg.ElectionTimeoutMin)

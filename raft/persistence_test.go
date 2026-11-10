@@ -174,3 +174,31 @@ func TestChaos(t *testing.T) {
 	c.submit("final-marker") // proves the healed cluster still works, and waits for all 3 to apply it
 	c.checkSafety()
 }
+
+// A leader counts ITS OWN copy of an entry toward the majority, so that copy
+// must be on disk too. Here "x" is committed on the leader and ONE follower.
+// Then that follower dies for good and the leader crashes and restarts, so the
+// only nodes left are the leader and the follower that never saw "x". If the
+// leader had not saved its own copy, those two would see equal ledgers, elect
+// a leader that lacks "x", and an acknowledged write would vanish.
+func TestLeaderOwnCopyCountsSoItMustBeOnDisk(t *testing.T) {
+	c := newCluster(t, 3)
+	leader := c.waitLeader()
+	withX := (leader + 1) % 3
+	withoutX := (leader + 2) % 3
+
+	c.isolate(withoutX)
+	index := c.submit("x", leader, withX) // committed on a majority: leader + withX
+
+	c.kill(withX)  // the only other holder of "x" is gone for good
+	c.kill(leader) // and the leader crashes...
+	c.restart(leader)
+	c.reconnect(withoutX)
+
+	survivors := []int{leader, withoutX}
+	c.waitLeader(survivors...)
+	if !c.waitApplied(survivors, index, "x", 5*time.Second) {
+		t.Fatal("an acknowledged write was lost: the leader's own copy was not on disk when it counted toward the majority")
+	}
+	c.checkSafety()
+}

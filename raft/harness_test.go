@@ -153,7 +153,7 @@ func (c *cluster) start(i int) {
 	nd, err := NewNode(Config{
 		ID: i, ClusterSize: c.n, Transport: endpoint{c.net, i}, DataDir: c.dirs[i],
 		DisableFsync:       true,
-		disableCheckQuorum: c.noCheckQuorum,
+		DisableStepDown:    c.noCheckQuorum,
 		ElectionTimeoutMin: 150 * time.Millisecond, ElectionTimeoutMax: 300 * time.Millisecond,
 		HeartbeatInterval: 40 * time.Millisecond,
 		Apply: func(index, term int, cmd []byte) {
