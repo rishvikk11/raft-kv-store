@@ -7,3 +7,4 @@ PROGRESS.md
 Dockerfile
 docker-compose.yml
 **/*_test.go
+deploy

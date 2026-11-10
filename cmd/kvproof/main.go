@@ -42,6 +42,8 @@ type nodeStatus struct {
 
 type proof struct {
 	compose string
+	kctx    string // kubectl context (Kubernetes target)
+	kns     string // kubectl namespace (Kubernetes target)
 	urls    []string
 	client  *http.Client // follows redirects to the leader
 
@@ -222,29 +224,64 @@ func (p *proof) converged() bool {
 	return true
 }
 
-func main() {
-	compose := flag.String("compose", "docker-compose.yml", "path to the compose file")
-	nodes := flag.String("nodes", "http://localhost:8081,http://localhost:8082,http://localhost:8083", "URLs of the three nodes as seen from this machine")
-	victimFlag := flag.String("victim", "leader", "which node to kill: leader, or a node number")
-	keep := flag.Bool("keep", false, "leave the cluster running when finished")
-	fresh := flag.Bool("fresh", true, "begin by deleting old containers AND volumes (docker compose down -v)")
-	writers := flag.Int("writers", 4, "number of concurrent writers")
-	downFor := flag.Duration("down-for", 3*time.Second, "keep the killed node down at least this long, with traffic still flowing")
-	flag.Parse()
+// verifyAll stops the writers and checks the promise: everything the cluster
+// ever acknowledged is still there, and all three nodes agree.
+func (p *proof) verifyAll(stepNo int) {
+	p.step(stepNo, "stop writing and check nothing acknowledged was lost", "this is the promise: if the cluster said a write was saved, it must still be there")
+	close(p.stop)
+	p.wg.Wait()
+	same := waitUntil(60*time.Second, p.converged)
+	p.check(same, "all three nodes ended with identical ledgers, fully applied")
+	p.mu.Lock()
+	all := append([]acked(nil), p.acked...)
+	p.mu.Unlock()
+	missing, wrong := 0, 0
+	for _, a := range all {
+		var got string
+		found := false
+		for try := 0; try < 40 && !found; try++ {
+			resp, err := p.client.Get(p.urls[try%len(p.urls)] + "/kv/" + a.key)
+			if err != nil {
+				time.Sleep(50 * time.Millisecond)
+				continue
+			}
+			b, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			if resp.StatusCode == http.StatusOK {
+				got, found = string(b), true
+			} else if resp.StatusCode == http.StatusNotFound {
+				break
+			} else {
+				time.Sleep(50 * time.Millisecond)
+			}
+		}
+		switch {
+		case !found:
+			missing++
+		case got != a.value:
+			wrong++
+		}
+	}
+	p.check(missing == 0 && wrong == 0, "every acknowledged write is still in the cluster",
+		"%d writes checked, %d missing, %d with the wrong value", len(all), missing, wrong)
 
+}
+
+// runDocker is the Docker Compose experiment (see the package comment).
+func runDocker(composeFile string, urls []string, victimFlag string, keep, fresh bool, writers int, downFor time.Duration) {
 	if _, err := exec.LookPath("docker"); err != nil {
 		fmt.Fprintln(os.Stderr, "docker was not found. Install Docker Desktop and make sure it is running.")
 		os.Exit(2)
 	}
 	p := &proof{
-		compose: *compose, urls: strings.Split(*nodes, ","), stop: make(chan struct{}),
+		compose: composeFile, urls: urls, stop: make(chan struct{}),
 		client: &http.Client{Timeout: 1500 * time.Millisecond},
 	}
 	runID := strconv.FormatInt(time.Now().UnixNano(), 36)
 
 	// ---- Step 1 ----
 	p.step(1, "start 3 containers, each with its own volume", "each node's saved state (term, vote, ledger) will live in a volume, not in the container")
-	if *fresh {
+	if fresh {
 		p.docker("down", "-v", "--remove-orphans")
 	}
 	if err := p.docker("up", "-d", "--build"); err != nil {
@@ -272,8 +309,8 @@ func main() {
 	p.dockerPlain("volume", "ls", "--filter", "name=raftkv")
 
 	// ---- Step 2 ----
-	p.step(2, "start continuous writing", fmt.Sprintf("%d clients write one value after another; a write only counts once the cluster says it is saved", *writers))
-	for w := 0; w < *writers; w++ {
+	p.step(2, "start continuous writing", fmt.Sprintf("%d clients write one value after another; a write only counts once the cluster says it is saved", writers))
+	for w := 0; w < writers; w++ {
 		p.wg.Add(1)
 		go p.writer(w, runID)
 	}
@@ -283,10 +320,10 @@ func main() {
 	// ---- Step 3 ----
 	leaderID, _, _ := p.leader()
 	victim := leaderID
-	if *victimFlag != "leader" {
-		v, err := strconv.Atoi(*victimFlag)
+	if victimFlag != "leader" {
+		v, err := strconv.Atoi(victimFlag)
 		if err != nil || v < 0 || v >= len(p.urls) {
-			say("bad -victim %q", *victimFlag)
+			say("bad -victim %q", victimFlag)
 			os.Exit(2)
 		}
 		victim = v
@@ -328,7 +365,7 @@ func main() {
 	} else {
 		p.check(false, "a new leader was elected without the killed node", "none appeared within 30s")
 	}
-	holdUntil := deathAt.Add(*downFor)
+	holdUntil := deathAt.Add(downFor)
 	enough := waitUntil(30*time.Second, func() bool {
 		return time.Now().After(holdUntil) && p.ackedCount() >= ackedAtDeath+50
 	})
@@ -387,50 +424,13 @@ func main() {
 	})
 	p.check(caught2, "and it caught up again", "cluster had committed %d entries", ls2.CommitIndex)
 
-	// ---- Step 7 ----
-	p.step(7, "stop writing and check nothing acknowledged was lost", "this is the promise: if the cluster said a write was saved, it must still be there")
-	close(p.stop)
-	p.wg.Wait()
-	same := waitUntil(60*time.Second, p.converged)
-	p.check(same, "all three nodes ended with identical ledgers, fully applied")
-	p.mu.Lock()
-	all := append([]acked(nil), p.acked...)
-	p.mu.Unlock()
-	missing, wrong := 0, 0
-	for _, a := range all {
-		var got string
-		found := false
-		for try := 0; try < 40 && !found; try++ {
-			resp, err := p.client.Get(p.urls[try%len(p.urls)] + "/kv/" + a.key)
-			if err != nil {
-				time.Sleep(50 * time.Millisecond)
-				continue
-			}
-			b, _ := io.ReadAll(resp.Body)
-			resp.Body.Close()
-			if resp.StatusCode == http.StatusOK {
-				got, found = string(b), true
-			} else if resp.StatusCode == http.StatusNotFound {
-				break
-			} else {
-				time.Sleep(50 * time.Millisecond)
-			}
-		}
-		switch {
-		case !found:
-			missing++
-		case got != a.value:
-			wrong++
-		}
-	}
-	p.check(missing == 0 && wrong == 0, "every acknowledged write is still in the cluster",
-		"%d writes checked, %d missing, %d with the wrong value", len(all), missing, wrong)
+	p.verifyAll(7)
 
 	if len(p.failed) > 0 {
 		say("\nsomething failed, so the cluster is being LEFT RUNNING for inspection. Recent logs:")
 		p.docker("logs", "--tail", "25")
 		say("clean up with: docker compose down -v")
-	} else if !*keep {
+	} else if !keep {
 		say("\ncleaning up: docker compose down (the volumes are kept; add -v to delete them)")
 		p.docker("down")
 	}
@@ -443,4 +443,46 @@ func main() {
 		os.Exit(1)
 	}
 	say("Saved state survived an abrupt kill and a full container replacement.")
+}
+
+func main() {
+	target := flag.String("target", "docker", "docker (Docker Compose) or k8s (Kubernetes in kind)")
+	compose := flag.String("compose", "docker-compose.yml", "docker target: path to the compose file")
+	nodes := flag.String("nodes", "", "URLs of the three nodes as seen from this machine (default depends on -target)")
+	victimFlag := flag.String("victim", "", "which node to kill: leader, or a node number (default: the leader for docker and for k8s restart, a follower for k8s disk-loss)")
+	keep := flag.Bool("keep", false, "docker target: leave the cluster running when finished")
+	fresh := flag.Bool("fresh", true, "docker target: begin by deleting old containers AND volumes (docker compose down -v)")
+	writers := flag.Int("writers", 4, "number of concurrent writers")
+	downFor := flag.Duration("down-for", 3*time.Second, "docker target: keep the killed node down at least this long, with traffic still flowing")
+	hold := flag.Duration("hold", 4*time.Second, "k8s target: keep the replacement pod from starting for this long (the node is cordoned), so only two nodes serve traffic; 0 turns this off")
+	scenario := flag.String("scenario", "restart", "k8s target: restart (pod deleted, its disk kept) or disk-loss (pod AND its disk deleted)")
+	kctx := flag.String("context", "kind-raftkv", "k8s target: kubectl context")
+	namespace := flag.String("namespace", "raftkv", "k8s target: namespace")
+	serviceURL := flag.String("service-url", "http://localhost:30080", "k8s target: address of the client Service as seen from this machine")
+	flag.Parse()
+
+	switch *target {
+	case "docker":
+		n := *nodes
+		if n == "" {
+			n = "http://localhost:8081,http://localhost:8082,http://localhost:8083"
+		}
+		v := *victimFlag
+		if v == "" {
+			v = "leader"
+		}
+		runDocker(*compose, strings.Split(n, ","), v, *keep, *fresh, *writers, *downFor)
+	case "k8s":
+		n := *nodes
+		if n == "" {
+			n = "http://localhost:30081,http://localhost:30082,http://localhost:30083"
+		}
+		runK8s(k8sOptions{
+			scenario: *scenario, context: *kctx, namespace: *namespace, serviceURL: *serviceURL,
+			urls: strings.Split(n, ","), victim: *victimFlag, writers: *writers, hold: *hold,
+		})
+	default:
+		fmt.Fprintf(os.Stderr, "unknown -target %q (use docker or k8s)\n", *target)
+		os.Exit(2)
+	}
 }
