@@ -161,3 +161,38 @@ func TestWorksOnUnreliableNetwork(t *testing.T) {
 	}
 	c.checkSafety()
 }
+
+// Everything so far ran with 3 nodes. With 5, a majority is 3, so the cluster
+// must keep working with two nodes down and must stop committing with three down.
+func TestFiveNodeClusterMajorityArithmetic(t *testing.T) {
+	c := newCluster(t, 5)
+	leader := c.waitLeader()
+	c.submit("all-five-up")
+
+	// Lose two nodes, one of them the leader: 3 of 5 is still a majority.
+	other := (leader + 1) % 5
+	c.kill(leader)
+	c.kill(other)
+	survivors := c.live()
+	c.waitLeader(survivors...)
+	c.submit("two-down", survivors...)
+
+	// Lose a third: 2 of 5 is NOT a majority, so nothing may commit.
+	newLeader := c.waitLeader(survivors...)
+	var victim int
+	for _, i := range survivors {
+		if i != newLeader {
+			victim = i
+			break
+		}
+	}
+	c.kill(victim)
+	index, _, ok := c.node(newLeader).Propose([]byte("three-down"))
+	if ok {
+		time.Sleep(700 * time.Millisecond)
+		if st := c.node(newLeader).Status(); st.CommitIndex >= index {
+			t.Fatal("committed an entry with only 2 of 5 nodes alive")
+		}
+	}
+	c.checkSafety()
+}

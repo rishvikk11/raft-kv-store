@@ -31,6 +31,7 @@ func main() {
 	id := flag.Int("id", 0, "this node's index in -peers")
 	peers := flag.String("peers", "", "comma-separated base URLs of all nodes in ID order; empty runs standalone without Raft")
 	data := flag.String("data", "", "directory for this node's Raft state (required with -peers)")
+	noFsync := flag.Bool("unsafe-no-fsync", false, "BENCHMARKING ONLY: do not force writes to disk; a crash can lose acknowledged data")
 	flag.Parse()
 
 	if *peers == "" {
@@ -61,8 +62,11 @@ func main() {
 
 	rep, err := kv.NewReplicated(raft.Config{
 		ID: *id, ClusterSize: len(urls), Transport: raft.NewHTTPTransport(urls),
-		DataDir: *data, Logf: log.Printf,
+		DataDir: *data, Logf: log.Printf, DisableFsync: *noFsync,
 	}, urls)
+	if *noFsync {
+		log.Printf("WARNING: -unsafe-no-fsync is on: acknowledged writes are NOT guaranteed to survive a crash")
+	}
 	if err != nil {
 		log.Fatal(err)
 	}
