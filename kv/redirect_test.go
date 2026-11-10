@@ -10,7 +10,7 @@ import (
 // network). A follower must redirect clients to the CLIENT-facing address.
 func TestRedirectGoesToTheClientFacingAddress(t *testing.T) {
 	public := []string{"http://node0.public.example:9000", "http://node1.public.example:9000", "http://node2.public.example:9000"}
-	lc := startClusterOpts(t, 3, false, public)
+	lc := startClusterOpts(t, 3, clusterOpts{clientURLs: public})
 	leader := lc.leader()
 	follower := (leader + 1) % 3
 

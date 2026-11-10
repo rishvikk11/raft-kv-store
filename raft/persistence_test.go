@@ -219,3 +219,72 @@ func TestStatusReportsWhatWasRecoveredFromDisk(t *testing.T) {
 		t.Fatalf("restarted node reports it recovered %d entries, term %d; want 3, 4", st.RecoveredEntries, st.RecoveredTerm)
 	}
 }
+
+// THE UNSAFE CASE, ON PURPOSE. This test passes when an acknowledged write is
+// LOST. It documents why a node that loses its disk cannot just be restarted.
+//
+// A, B and C. A write is acknowledged once A and B both hold it; C never saw it.
+// Now B's disk is wiped (B comes back blank, still calling itself B) and A is
+// lost for good. B and C are left. B has forgotten the write, C never had it,
+// and together they are a majority, so they carry on without it. Raft's safety
+// argument ("every majority overlaps with the nodes that hold a committed
+// entry") assumed B still remembered what it had promised. A blank B breaks
+// that assumption.
+//
+// The correct response to a lost disk is to treat that member as DEAD and
+// replace it through a cluster membership change (paper, section 6). This
+// project does not implement membership changes.
+func TestNodeThatLosesItsDiskCanLoseAcknowledgedWrites(t *testing.T) {
+	c := newCluster(t, 3)
+	a := c.waitLeader()
+	b := (a + 1) % 3
+	cNode := (a + 2) % 3
+
+	c.isolate(cNode)
+	c.submit("acknowledged-write", a, b) // acknowledged: held by A and B
+
+	c.kill(b)
+	if err := os.RemoveAll(c.dirs[b]); err != nil { // B's disk is lost
+		t.Fatal(err)
+	}
+	c.restart(b) // same identity, empty memory
+	c.kill(a)    // and A is gone for good
+	c.reconnect(cNode)
+
+	survivors := []int{b, cNode}
+	c.waitLeader(survivors...)
+	c.submit("written-afterwards", survivors...) // the cluster "works" again...
+
+	for _, n := range survivors {
+		if slices.Contains(c.appliedCmds(n), "acknowledged-write") {
+			t.Fatalf("node %d still has the write; this test expects it to be lost (if Raft ever keeps it, the scenario above no longer reproduces the problem)", n)
+		}
+	}
+	t.Logf("as expected: the cluster is up and accepting writes, but the write it acknowledged earlier is gone")
+}
+
+// THE CONTROL. Exactly the same story as above, except B's disk is NOT wiped.
+// The only difference between the two tests is the disk, and this time the
+// acknowledged write survives: B remembers it, C cannot win without it.
+func TestSameScenarioWithTheDiskIntactKeepsTheWrite(t *testing.T) {
+	c := newCluster(t, 3)
+	a := c.waitLeader()
+	b := (a + 1) % 3
+	cNode := (a + 2) % 3
+
+	c.isolate(cNode)
+	index := c.submit("acknowledged-write", a, b)
+
+	c.kill(b)
+	c.restart(b) // same identity AND same memory: its data directory is untouched
+	c.kill(a)
+	c.reconnect(cNode)
+
+	survivors := []int{b, cNode}
+	c.waitLeader(survivors...)
+	if !c.waitApplied(survivors, index, "acknowledged-write", 5*time.Second) {
+		t.Fatal("the acknowledged write was lost even though B's disk was intact")
+	}
+	c.submit("written-afterwards", survivors...)
+	c.checkSafety()
+}
