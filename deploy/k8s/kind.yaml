@@ -1,0 +1,40 @@
+# A tiny Kubernetes cluster that runs inside Docker on your own laptop (no cloud,
+# no cost). "kind" = Kubernetes IN Docker.
+#
+# One node is enough to see how Kubernetes treats stateful pods. Be aware of what
+# that means: all three of our pods share this one node, so this cluster shows how
+# Kubernetes restarts and re-attaches pods, NOT how it survives losing a machine.
+#
+# extraPortMappings opens doors from your laptop (localhost) into the cluster:
+#   30080  the client Service (any node answers; followers pass requests on)
+#   30081..30083  one door per pod, so tools can ask each pod about itself
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: raftkv
+nodes:
+  - role: control-plane
+    extraPortMappings:
+      - {
+          containerPort: 30080,
+          hostPort: 30080,
+          listenAddress: "127.0.0.1",
+          protocol: TCP,
+        }
+      - {
+          containerPort: 30081,
+          hostPort: 30081,
+          listenAddress: "127.0.0.1",
+          protocol: TCP,
+        }
+      - {
+          containerPort: 30082,
+          hostPort: 30082,
+          listenAddress: "127.0.0.1",
+          protocol: TCP,
+        }
+      - {
+          containerPort: 30083,
+          hostPort: 30083,
+          listenAddress: "127.0.0.1",
+          protocol: TCP,
+        }

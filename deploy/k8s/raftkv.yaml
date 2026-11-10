@@ -1,0 +1,191 @@
+# The Raft key-value store on Kubernetes.
+#
+#   namespace          a folder that keeps all of this together (and makes cleanup easy)
+#   kv-headless        a Service that gives every pod its own stable DNS name
+#   kv                 the Service clients use; it picks any ready pod
+#   kv-N-ext           one door per pod, for tools that need to talk to a SPECIFIC pod
+#   StatefulSet kv     the pods themselves: kv-0, kv-1, kv-2, each with its own disk
+#   PodDisruptionBudget  "never take more than one down on purpose"
+#
+# Who is responsible for what:
+#   Kubernetes  restarts and re-creates pods, keeps each pod's name and disk attached.
+#   Raft        keeps the DATA correct: elections, copying the ledger, what is committed.
+# Neither one replaces the other.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: raftkv
+---
+# "Headless" (clusterIP: None) means: no single shared address and no load
+# balancing. Instead Kubernetes publishes one DNS name PER POD:
+#   kv-0.kv-headless.raftkv.svc.cluster.local
+# That is how the nodes find each other, and the name stays the same when a pod is
+# replaced. publishNotReadyAddresses keeps a pod's name resolvable even before it
+# reports ready, so nodes can reach each other while the cluster is forming.
+apiVersion: v1
+kind: Service
+metadata:
+  name: kv-headless
+  namespace: raftkv
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    app: kv
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+---
+# The Service clients use. It sends each request to some ready pod. That pod may
+# not be the leader, which is fine: the server is started with -forward, so a
+# follower passes the request on to the leader. NodePort 30080 is the door that
+# kind maps to localhost:30080 on your laptop.
+apiVersion: v1
+kind: Service
+metadata:
+  name: kv
+  namespace: raftkv
+spec:
+  type: NodePort
+  selector:
+    app: kv
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+      nodePort: 30080
+---
+# One Service per pod, selecting that single pod by name (Kubernetes puts the label
+# statefulset.kubernetes.io/pod-name on every StatefulSet pod). When kv-1 is
+# replaced, kv-1-ext simply points at the new kv-1.
+apiVersion: v1
+kind: Service
+metadata:
+  name: kv-0-ext
+  namespace: raftkv
+spec:
+  type: NodePort
+  selector:
+    statefulset.kubernetes.io/pod-name: kv-0
+  ports:
+    - { name: http, port: 8080, targetPort: http, nodePort: 30081 }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kv-1-ext
+  namespace: raftkv
+spec:
+  type: NodePort
+  selector:
+    statefulset.kubernetes.io/pod-name: kv-1
+  ports:
+    - { name: http, port: 8080, targetPort: http, nodePort: 30082 }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kv-2-ext
+  namespace: raftkv
+spec:
+  type: NodePort
+  selector:
+    statefulset.kubernetes.io/pod-name: kv-2
+  ports:
+    - { name: http, port: 8080, targetPort: http, nodePort: 30083 }
+---
+# A StatefulSet, not a Deployment. A Deployment treats its pods like
+# interchangeable cattle: any pod can be replaced by a new one with a new name and
+# a blank disk. A Raft member is the opposite. Its identity IS its saved state
+# (its term, its vote, its ledger). So a StatefulSet gives each pod:
+#   * a fixed name: kv-0, kv-1, kv-2 (the number becomes the node's Raft ID)
+#   * a fixed DNS name (through kv-headless)
+#   * its own disk (a PersistentVolumeClaim) that is re-attached to the SAME pod
+#     name when the pod is replaced, and kept even if the pod is deleted.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: kv
+  namespace: raftkv
+spec:
+  serviceName: kv-headless
+  replicas: 3
+  # Start all three at once. (The default waits for each pod to be ready before
+  # starting the next; Raft needs several nodes up to elect a leader, so that
+  # would be needlessly slow.)
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      app: kv
+  template:
+    metadata:
+      labels:
+        app: kv
+    spec:
+      terminationGracePeriodSeconds: 10
+      # Run as an ordinary user, never root. fsGroup makes the disk writable by it.
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+      containers:
+        - name: kv
+          image: raft-kv:dev
+          # The image is loaded into the kind cluster directly, not pulled from a registry.
+          imagePullPolicy: IfNotPresent
+          args:
+            - "-addr=:8080"
+            - "-data=/data"
+            - "-forward"
+            # -id is left out on purpose: the node takes its ID from the number at
+            # the end of its pod name (kv-0 -> 0, kv-1 -> 1, kv-2 -> 2).
+            - "-peers=http://kv-0.kv-headless.raftkv.svc.cluster.local:8080,http://kv-1.kv-headless.raftkv.svc.cluster.local:8080,http://kv-2.kv-headless.raftkv.svc.cluster.local:8080"
+          ports:
+            - name: http
+              containerPort: 8080
+          # "Ready" = send me client traffic. A follower is ready too, so this does
+          # not wait for an election.
+          readinessProbe:
+            httpGet: { path: /raft/status, port: http }
+            periodSeconds: 2
+            failureThreshold: 3
+          # "Alive" = if this keeps failing, Kubernetes restarts the container.
+          livenessProbe:
+            httpGet: { path: /raft/status, port: http }
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            failureThreshold: 6
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: data
+              mountPath: /data
+  # This is what gives each pod its OWN disk. Kubernetes creates one claim per pod
+  # (data-kv-0, data-kv-1, data-kv-2). Deleting a pod does NOT delete its claim,
+  # so the replacement pod finds the same disk, and therefore the same Raft state.
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 1Gi
+---
+# If someone drains a machine for maintenance, Kubernetes may only take down ONE
+# of our pods at a time. Two of three is still a majority; one of three is not.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: kv
+  namespace: raftkv
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app: kv
