@@ -1,0 +1,23 @@
+== machine ==
+Darwin arm64
+cpu:    Apple M3
+cores:  8   macOS 26.6.2
+mode:   kubernetes (kind, ONE node), 3 pods, real fsync, a PersistentVolumeClaim each
+path:   this program -> Docker port mapping -> kube-proxy -> leader pod
+
+kvbench  go=go1.27.3  darwin/arm64  cpus=8
+cluster  nodes=3  leader=node 0 (term 2)  value=100B  request-ids=true  warmup=2s  measured=10s
+
+workload  clients    ops/sec    p50 ms    p95 ms    p99 ms    max ms  errors  checks
+write           1        774      0.98      3.35      5.96     49.46       0  ok (50 keys read back correctly)
+write           8       1598      3.67     10.60     17.93     39.06       0  ok (400 keys read back correctly)
+write          32       1075     16.67     72.76    116.20    223.65       0  ok (1600 keys read back correctly)
+write         128       1603     76.44    132.04    224.72    309.37       0  ok (6400 keys read back correctly)
+read            1       2360      0.40      0.55      0.65     13.05       0  ok
+read            8       9325      0.76      1.42      2.48     31.13       0  ok
+read           32      21345      1.45      2.15      2.67      8.90       0  ok
+read          128      29135      4.14      6.89      9.03     23.42       0  ok
+mixed           1       1908      0.37      1.16      2.92     32.58       0  ok (50 keys read back correctly)
+mixed           8       6182      1.00      2.96      3.98     11.64       0  ok (400 keys read back correctly)
+mixed          32       8901      3.26      6.48     12.92     29.15       0  ok (1600 keys read back correctly)
+mixed         128      12249      9.59     16.74     37.78     94.78       0  ok (6400 keys read back correctly)
