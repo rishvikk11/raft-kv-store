@@ -5,6 +5,7 @@ package raft
 // "partition" or "crash" in a test is repeatable instead of a lucky accident.
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"math/rand"
@@ -105,10 +106,11 @@ type appliedEntry struct {
 }
 
 type cluster struct {
-	t    *testing.T
-	n    int
-	net  *testNet
-	dirs []string
+	t             *testing.T
+	n             int
+	net           *testNet
+	dirs          []string
+	noCheckQuorum bool
 
 	mu         sync.Mutex
 	nodes      []*Node
@@ -120,10 +122,14 @@ type cluster struct {
 	monDone chan struct{}
 }
 
-func newCluster(t *testing.T, n int) *cluster {
+func newCluster(t *testing.T, n int) *cluster { return newClusterWith(t, n, false) }
+
+// newClusterWith can switch off the leader's timer-based step-down. That models
+// a leader that is paused or slow and has not noticed yet that it was replaced.
+func newClusterWith(t *testing.T, n int, noCheckQuorum bool) *cluster {
 	t.Helper()
 	c := &cluster{
-		t: t, n: n, net: newTestNet(),
+		t: t, n: n, net: newTestNet(), noCheckQuorum: noCheckQuorum,
 		dirs: make([]string, n), nodes: make([]*Node, n), applied: make([][]appliedEntry, n),
 		termLeader: map[int]int{}, stopMon: make(chan struct{}), monDone: make(chan struct{}),
 	}
@@ -147,6 +153,7 @@ func (c *cluster) start(i int) {
 	nd, err := NewNode(Config{
 		ID: i, ClusterSize: c.n, Transport: endpoint{c.net, i}, DataDir: c.dirs[i],
 		DisableFsync:       true,
+		disableCheckQuorum: c.noCheckQuorum,
 		ElectionTimeoutMin: 150 * time.Millisecond, ElectionTimeoutMax: 300 * time.Millisecond,
 		HeartbeatInterval: 40 * time.Millisecond,
 		Apply: func(index, term int, cmd []byte) {
@@ -393,4 +400,35 @@ func waitUntil(t *testing.T, d time.Duration, what string, cond func() bool) {
 		time.Sleep(5 * time.Millisecond)
 	}
 	t.Fatalf("timed out waiting for: %s", what)
+}
+
+// latest is the toy "state machine" used in read tests: the value of the most
+// recent command node i has applied ("" if none).
+func (c *cluster) latest(i int) string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for k := len(c.applied[i]) - 1; k >= 0; k-- {
+		if c.applied[i][k].cmd != "" {
+			return c.applied[i][k].cmd
+		}
+	}
+	return ""
+}
+
+// naiveRead is what Stage 2 did: if I believe I am the leader, answer from my own data.
+func (c *cluster) naiveRead(i int) (string, bool) {
+	if c.node(i).Status().Role != Leader {
+		return "", false
+	}
+	return c.latest(i), true
+}
+
+// safeRead asks the node to confirm the read first (see Node.ConfirmRead).
+func (c *cluster) safeRead(i int, within time.Duration) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), within)
+	defer cancel()
+	if err := c.node(i).ConfirmRead(ctx); err != nil {
+		return "", err
+	}
+	return c.latest(i), nil
 }

@@ -10,6 +10,7 @@
 package raft
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"math/rand"
@@ -77,6 +78,12 @@ type AppendEntriesReply struct {
 	ConflictIndex int `json:"conflictIndex"`
 }
 
+var (
+	ErrNotLeader      = errors.New("raft: not the leader")
+	ErrLostLeadership = errors.New("raft: lost leadership while waiting")
+	ErrStopped        = errors.New("raft: node stopped")
+)
+
 // Transport delivers messages to other nodes. A nil reply with an error means
 // the message or its response was lost. Tests use an in-memory implementation;
 // real clusters use HTTPTransport.
@@ -99,6 +106,10 @@ type Config struct {
 	ElectionTimeoutMax time.Duration // default 600ms
 	HeartbeatInterval  time.Duration // default 75ms
 	DisableFsync       bool          // tests only: skip forcing writes to disk
+	// disableCheckQuorum is for tests only. Step-down is timer-based, so a
+	// leader that is paused or slow can still hold a stale belief for a while.
+	// This switch freezes that moment so a test can examine it deterministically.
+	disableCheckQuorum bool
 	Logf               func(format string, args ...any)
 }
 
@@ -118,6 +129,7 @@ type Node struct {
 	stopCh    chan struct{}
 	wg        sync.WaitGroup
 	applyCond *sync.Cond
+	changed   chan struct{} // closed and replaced whenever something a waiting read cares about changes
 
 	// Persistent state (Figure 2). Saved to the WAL before we reply to anyone.
 	term     int
@@ -138,6 +150,8 @@ type Node struct {
 	matchIndex  []int // per peer: highest index known stored there (self included)
 	kicks       []chan struct{}
 	lastContact []time.Time // per peer: when it last answered us (used to notice we are cut off)
+	readSeq     int         // counts read requests; every heartbeat carries it
+	ackedSeq    []int       // per peer: highest readSeq a heartbeat to it carried when it answered
 }
 
 func NewNode(cfg Config) (*Node, error) {
@@ -173,6 +187,8 @@ func NewNode(cfg Config) (*Node, error) {
 		role: Follower, leaderID: -1,
 		nextIndex: make([]int, cfg.ClusterSize), matchIndex: make([]int, cfg.ClusterSize),
 		lastContact: make([]time.Time, cfg.ClusterSize),
+		ackedSeq:    make([]int, cfg.ClusterSize),
+		changed:     make(chan struct{}),
 	}
 	nd.applyCond = sync.NewCond(&nd.mu)
 	return nd, nil
@@ -201,6 +217,7 @@ func (nd *Node) Stop() {
 	nd.stopped = true
 	close(nd.stopCh)
 	nd.applyCond.Broadcast()
+	nd.notifyLocked()
 	nd.mu.Unlock()
 
 	nd.wg.Wait()
@@ -298,6 +315,7 @@ func (nd *Node) becomeFollowerLocked(term int) {
 		nd.role = Follower
 		nd.resetElectionTimerLocked()
 	}
+	nd.notifyLocked()
 }
 
 // ---- background loops ----
@@ -344,6 +362,7 @@ func (nd *Node) applier() {
 		}
 		nd.mu.Lock()
 		nd.lastApplied = start + len(entries) - 1
+		nd.notifyLocked()
 	}
 }
 
@@ -404,6 +423,7 @@ func (nd *Node) becomeLeaderLocked() {
 		nd.nextIndex[p] = nd.lastIndex() + 1
 		nd.matchIndex[p] = 0
 		nd.lastContact[p] = time.Now() // a fresh leader gets one timeout of grace
+		nd.ackedSeq[p] = 0
 	}
 	// First act: a no-op entry in the new term. Once it commits, everything
 	// before it commits too (see advanceCommitLocked for why we need this).
@@ -430,7 +450,7 @@ func (nd *Node) becomeLeaderLocked() {
 // serving. The window matches the earliest moment a follower could start a
 // replacement election, so a cut-off leader quits about when it gets replaced.
 func (nd *Node) checkQuorumLocked() {
-	if nd.n == 1 {
+	if nd.n == 1 || nd.cfg.disableCheckQuorum {
 		return
 	}
 	cutoff := time.Now().Add(-nd.cfg.ElectionTimeoutMin)
@@ -445,7 +465,99 @@ func (nd *Node) checkQuorumLocked() {
 		nd.role = Follower
 		nd.leaderID = -1
 		nd.resetElectionTimerLocked()
+		nd.notifyLocked()
 	}
+}
+
+// notifyLocked wakes everything blocked in waitLocked.
+func (nd *Node) notifyLocked() {
+	close(nd.changed)
+	nd.changed = make(chan struct{})
+}
+
+// waitLocked sleeps until something changes (or ctx ends), then re-checks that
+// we are still the leader of the same term. Called and returns with nd.mu held.
+func (nd *Node) waitLocked(ctx context.Context, term int) error {
+	ch := nd.changed
+	nd.mu.Unlock()
+	var err error
+	select {
+	case <-ch:
+	case <-ctx.Done():
+		err = ctx.Err()
+	}
+	nd.mu.Lock()
+	switch {
+	case err != nil:
+		return err
+	case nd.stopped:
+		return ErrStopped
+	case nd.role != Leader || nd.term != term:
+		return ErrLostLeadership
+	}
+	return nil
+}
+
+// ConfirmRead makes a local read safe. When it returns nil, this node's state
+// machine contains every write that finished before ConfirmRead was called, so
+// the caller may now read from it and the answer cannot be stale.
+//
+// A leader cannot tell by itself that it is STILL the leader: it may have been
+// cut off while another leader was elected and accepted newer writes. So it:
+//  1. waits until it has committed an entry from its own term (the no-op
+//     counts), because only then does it know the true commit point;
+//  2. remembers that commit point (the "read index");
+//  3. sends fresh heartbeats and waits for a majority to answer. That proves
+//     no newer leader existed at that moment;
+//  4. waits until its state machine has applied everything up to the read index.
+//
+// It returns ErrNotLeader on a follower. If it cannot reach a majority it waits
+// until ctx ends instead of guessing.
+func (nd *Node) ConfirmRead(ctx context.Context) error {
+	nd.mu.Lock()
+	defer nd.mu.Unlock()
+	if nd.stopped {
+		return ErrStopped
+	}
+	if nd.role != Leader {
+		return ErrNotLeader
+	}
+	term := nd.term
+
+	for nd.log[nd.commitIndex].Term != term { // 1
+		if err := nd.waitLocked(ctx, term); err != nil {
+			return err
+		}
+	}
+	readIndex := nd.commitIndex // 2
+
+	nd.readSeq++ // 3
+	seq := nd.readSeq
+	nd.kickAllLocked()
+	for !nd.majorityAckedLocked(seq) {
+		if err := nd.waitLocked(ctx, term); err != nil {
+			return err
+		}
+	}
+
+	for nd.lastApplied < readIndex { // 4
+		if err := nd.waitLocked(ctx, term); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// majorityAckedLocked: have a majority (counting ourselves) answered a
+// heartbeat that was built after read number seq was registered?
+func (nd *Node) majorityAckedLocked(seq int) bool {
+	acks := 1
+	for p := 0; p < nd.n; p++ {
+		if p != nd.id && nd.ackedSeq[p] >= seq {
+			acks++
+		}
+	}
+	return acks*2 > nd.n
 }
 
 // HandleRequestVote is the receiver side of RequestVote (Figure 2).
@@ -487,6 +599,7 @@ func (nd *Node) replicate(peer, term int, kick <-chan struct{}) {
 			return
 		}
 		next := nd.nextIndex[peer]
+		seq := nd.readSeq // reads registered before this message was built
 		args := AppendEntriesArgs{
 			Term: term, LeaderID: nd.id,
 			PrevLogIndex: next - 1, PrevLogTerm: nd.log[next-1].Term,
@@ -509,6 +622,12 @@ func (nd *Node) replicate(peer, term int, kick <-chan struct{}) {
 		if err == nil {
 			if reply.Term <= nd.term {
 				nd.lastContact[peer] = time.Now() // this follower is reachable and still follows us
+				// It accepted us as leader at some moment after we built this
+				// message, so every read registered before then is now confirmed by it.
+				if seq > nd.ackedSeq[peer] {
+					nd.ackedSeq[peer] = seq
+					nd.notifyLocked()
+				}
 			}
 			switch {
 			case reply.Term > nd.term:
@@ -575,6 +694,7 @@ func (nd *Node) advanceCommitLocked() {
 		if count*2 > nd.n {
 			nd.commitIndex = idx
 			nd.applyCond.Broadcast()
+			nd.notifyLocked()
 			return
 		}
 	}
