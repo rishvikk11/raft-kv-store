@@ -8,6 +8,11 @@
 //
 // -peers lists every node's base URL in node-ID order; each node serves both
 // client requests and Raft messages on its own URL.
+//
+// -client-urls is optional. When nodes reach each other by names that only exist
+// inside a private network (for example Docker's kv1:8080), clients outside that
+// network cannot follow a redirect to such a name. -client-urls gives, in the
+// same order, the addresses clients should be redirected to instead.
 package main
 
 import (
@@ -30,6 +35,7 @@ func main() {
 	addr := flag.String("addr", "", "listen address (cluster default: taken from this node's -peers URL; standalone default :8080)")
 	id := flag.Int("id", 0, "this node's index in -peers")
 	peers := flag.String("peers", "", "comma-separated base URLs of all nodes in ID order; empty runs standalone without Raft")
+	clientURLs := flag.String("client-urls", "", "comma-separated URLs clients use to reach each node, in ID order, used for redirects (default: same as -peers)")
 	data := flag.String("data", "", "directory for this node's Raft state (required with -peers)")
 	noFsync := flag.Bool("unsafe-no-fsync", false, "BENCHMARKING ONLY: do not force writes to disk; a crash can lose acknowledged data")
 	flag.Parse()
@@ -60,10 +66,18 @@ func main() {
 		listen = u.Host
 	}
 
+	redirectTo := urls
+	if *clientURLs != "" {
+		redirectTo = strings.Split(*clientURLs, ",")
+		if len(redirectTo) != len(urls) {
+			log.Fatalf("-client-urls has %d entries but -peers has %d", len(redirectTo), len(urls))
+		}
+	}
+
 	rep, err := kv.NewReplicated(raft.Config{
 		ID: *id, ClusterSize: len(urls), Transport: raft.NewHTTPTransport(urls),
 		DataDir: *data, Logf: log.Printf, DisableFsync: *noFsync,
-	}, urls)
+	}, redirectTo)
 	if *noFsync {
 		log.Printf("WARNING: -unsafe-no-fsync is on: acknowledged writes are NOT guaranteed to survive a crash")
 	}
