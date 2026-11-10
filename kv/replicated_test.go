@@ -23,7 +23,8 @@ type liveCluster struct {
 	reps       []*Replicated
 	srvs       []*http.Server
 	http       *http.Client
-	noStepDown bool // fault-injection: leaders never give up on their own (see raft.Config.DisableStepDown)
+	clientURLs []string // what followers redirect clients to; nil means the same URLs the nodes use
+	noStepDown bool     // fault-injection: leaders never give up on their own (see raft.Config.DisableStepDown)
 	// faults can cut the Raft messages between nodes (a network partition)
 	// without touching the clients' connections to them.
 	faults *faultNet
@@ -33,8 +34,14 @@ func startCluster(t *testing.T, n int) *liveCluster { return startClusterWith(t,
 
 func startClusterWith(t *testing.T, n int, noStepDown bool) *liveCluster {
 	t.Helper()
+	return startClusterOpts(t, n, noStepDown, nil)
+}
+
+func startClusterOpts(t *testing.T, n int, noStepDown bool, clientURLs []string) *liveCluster {
+	t.Helper()
 	lc := &liveCluster{
 		noStepDown: noStepDown,
+		clientURLs: clientURLs,
 		t:          t, urls: make([]string, n), dirs: make([]string, n),
 		reps: make([]*Replicated, n), srvs: make([]*http.Server, n),
 		http:   &http.Client{Timeout: 8 * time.Second}, // follows 307 redirects, re-sending the body
@@ -61,6 +68,13 @@ func startClusterWith(t *testing.T, n int, noStepDown bool) *liveCluster {
 	return lc
 }
 
+func (lc *liveCluster) redirectURLs() []string {
+	if lc.clientURLs != nil {
+		return lc.clientURLs
+	}
+	return lc.urls
+}
+
 func (lc *liveCluster) boot(i int, ln net.Listener) {
 	rep, err := NewReplicated(raft.Config{
 		ID: i, ClusterSize: len(lc.urls), DataDir: lc.dirs[i],
@@ -69,7 +83,7 @@ func (lc *liveCluster) boot(i int, ln net.Listener) {
 		DisableStepDown:    lc.noStepDown,
 		ElectionTimeoutMin: 150 * time.Millisecond, ElectionTimeoutMax: 300 * time.Millisecond,
 		HeartbeatInterval: 40 * time.Millisecond,
-	}, lc.urls)
+	}, lc.redirectURLs())
 	if err != nil {
 		lc.t.Fatal(err)
 	}

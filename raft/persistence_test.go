@@ -202,3 +202,20 @@ func TestLeaderOwnCopyCountsSoItMustBeOnDisk(t *testing.T) {
 	}
 	c.checkSafety()
 }
+
+// A restarted node reports what it read from its OWN disk. This is what lets an
+// outside observer tell "remembered it" apart from "was refilled by the leader".
+func TestStatusReportsWhatWasRecoveredFromDisk(t *testing.T) {
+	dir := t.TempDir()
+	a := newBareNode(t, dir, 0, 3)
+	if st := a.Status(); st.RecoveredEntries != 0 || st.RecoveredTerm != 0 {
+		t.Fatalf("a brand-new node reports it recovered %d entries, term %d; want 0, 0", st.RecoveredEntries, st.RecoveredTerm)
+	}
+	a.HandleAppendEntries(AppendEntriesArgs{Term: 4, LeaderID: 1, Entries: ents(1, 2, 4)})
+	a.Stop()
+
+	b := newBareNode(t, dir, 0, 3)
+	if st := b.Status(); st.RecoveredEntries != 3 || st.RecoveredTerm != 4 {
+		t.Fatalf("restarted node reports it recovered %d entries, term %d; want 3, 4", st.RecoveredEntries, st.RecoveredTerm)
+	}
+}

@@ -49,7 +49,7 @@ type session struct {
 
 type Replicated struct {
 	store *Store
-	peers []string // base URL of each node, indexed by node ID
+	peers []string // address clients use for each node, indexed by node ID (used for redirects)
 	node  *raft.Node
 
 	// Part of the replicated state, like store: rebuilt identically on every node
@@ -61,8 +61,12 @@ type Replicated struct {
 }
 
 // NewReplicated builds the node. cfg.Apply is set here; leave it nil.
-func NewReplicated(cfg raft.Config, peers []string) (*Replicated, error) {
-	r := &Replicated{store: NewStore(), peers: peers, sessions: map[string]session{}, waiters: map[int]chan applyResult{}}
+// clientURLs[i] is the address CLIENTS should use to reach node i. A follower
+// redirects a client there when it knows who the leader is. It can differ from
+// the address nodes use among themselves (cfg.Transport), for example when the
+// nodes live on a private network the clients are not part of.
+func NewReplicated(cfg raft.Config, clientURLs []string) (*Replicated, error) {
+	r := &Replicated{store: NewStore(), peers: clientURLs, sessions: map[string]session{}, waiters: map[int]chan applyResult{}}
 	cfg.Apply = r.apply
 	node, err := raft.NewNode(cfg)
 	if err != nil {

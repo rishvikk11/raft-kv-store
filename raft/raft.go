@@ -138,6 +138,8 @@ type Node struct {
 	log      []Entry
 	// what the WAL currently holds for term/votedFor, so we only write on change
 	savedTerm, savedVotedFor int
+	recoveredEntries         int // ledger entries found on disk at startup
+	recoveredTerm            int // term found on disk at startup
 
 	// Volatile state.
 	role             Role
@@ -185,6 +187,7 @@ func NewNode(cfg Config) (*Node, error) {
 		stopCh: make(chan struct{}),
 		term:   st.term, votedFor: st.votedFor, log: st.log,
 		savedTerm: st.term, savedVotedFor: st.votedFor,
+		recoveredEntries: len(st.log) - 1, recoveredTerm: st.term,
 		role: Follower, leaderID: -1,
 		nextIndex: make([]int, cfg.ClusterSize), matchIndex: make([]int, cfg.ClusterSize),
 		lastContact: make([]time.Time, cfg.ClusterSize),
@@ -229,6 +232,12 @@ func (nd *Node) Stop() {
 }
 
 type Status struct {
+	// RecoveredEntries and RecoveredTerm report what this process read from its
+	// own disk when it started, before it spoke to anyone. They never change
+	// afterwards, so they prove what a restarted node remembered by itself.
+	RecoveredEntries int `json:"recoveredEntries"`
+	RecoveredTerm    int `json:"recoveredTerm"`
+
 	ID           int  `json:"id"`
 	Term         int  `json:"term"`
 	Role         Role `json:"role"`
@@ -242,6 +251,7 @@ func (nd *Node) Status() Status {
 	nd.mu.Lock()
 	defer nd.mu.Unlock()
 	return Status{
+		RecoveredEntries: nd.recoveredEntries, RecoveredTerm: nd.recoveredTerm,
 		ID: nd.id, Term: nd.term, Role: nd.role, LeaderID: nd.leaderID,
 		CommitIndex: nd.commitIndex, LastApplied: nd.lastApplied, LastLogIndex: nd.lastIndex(),
 	}
