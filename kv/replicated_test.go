@@ -118,11 +118,18 @@ func waitFor(t *testing.T, d time.Duration, what string, cond func() bool) {
 
 // do sends a request to node `via`, retrying while the cluster is between leaders.
 func (lc *liveCluster) do(via int, method, key, body string) (int, string) {
+	return lc.doHdr(via, method, key, body, nil)
+}
+
+func (lc *liveCluster) doHdr(via int, method, key, body string, hdr map[string]string) (int, string) {
 	lc.t.Helper()
 	var code int
 	var out string
 	waitFor(lc.t, 15*time.Second, method+" "+key, func() bool {
 		req, _ := http.NewRequest(method, lc.urls[via]+"/kv/"+key, strings.NewReader(body))
+		for k, v := range hdr {
+			req.Header.Set(k, v)
+		}
 		resp, err := lc.http.Do(req)
 		if err != nil {
 			return false

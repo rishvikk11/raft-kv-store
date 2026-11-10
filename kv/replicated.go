@@ -6,28 +6,45 @@ package kv
 // committed entries in the same order, so every node's Store ends up identical.
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log"
 	"net/http"
+	"strconv"
 	"sync"
 	"time"
 
 	"github.com/rishvikk11/raft-kv-store/raft"
 )
 
-const commitTimeout = 5 * time.Second
+const (
+	commitTimeout = 5 * time.Second
+	readTimeout   = 2 * time.Second
+)
 
-// Command is what goes into the Raft ledger.
+// Command is what goes into the Raft ledger. ClientID and Seq identify a
+// request so that a retry of the same request is recognised and not applied twice.
 type Command struct {
-	Op    string `json:"op"` // "put" or "delete"
-	Key   string `json:"key"`
-	Value string `json:"value,omitempty"`
+	Op       string `json:"op"` // "put" or "delete"
+	Key      string `json:"key"`
+	Value    string `json:"value,omitempty"`
+	ClientID string `json:"clientId,omitempty"`
+	Seq      int64  `json:"seq,omitempty"`
 }
 
 type applyResult struct {
 	term    int  // term of the entry that was actually applied at this index
 	existed bool // for delete: did the key exist?
+	stale   bool // the request was older than one this client already completed
+}
+
+// session is what the cluster remembers about one client: the newest request
+// it completed and the answer given, so a retry gets the same answer.
+type session struct {
+	seq     int64
+	existed bool
 }
 
 type Replicated struct {
@@ -35,13 +52,17 @@ type Replicated struct {
 	peers []string // base URL of each node, indexed by node ID
 	node  *raft.Node
 
+	// Part of the replicated state, like store: rebuilt identically on every node
+	// by applying the same entries in the same order. Only apply() touches it.
+	sessions map[string]session
+
 	mu      sync.Mutex
 	waiters map[int]chan applyResult // HTTP requests waiting for a ledger index to be applied
 }
 
 // NewReplicated builds the node. cfg.Apply is set here; leave it nil.
 func NewReplicated(cfg raft.Config, peers []string) (*Replicated, error) {
-	r := &Replicated{store: NewStore(), peers: peers, waiters: map[int]chan applyResult{}}
+	r := &Replicated{store: NewStore(), peers: peers, sessions: map[string]session{}, waiters: map[int]chan applyResult{}}
 	cfg.Apply = r.apply
 	node, err := raft.NewNode(cfg)
 	if err != nil {
@@ -54,19 +75,39 @@ func NewReplicated(cfg raft.Config, peers []string) (*Replicated, error) {
 func (r *Replicated) Start() { r.node.Start() }
 func (r *Replicated) Stop()  { r.node.Stop() }
 
-// apply is called by Raft, once per committed entry, in order.
+// execute changes the Store. It is the only place a write takes effect.
+func (r *Replicated) execute(c Command) (existed bool) {
+	switch c.Op {
+	case "put":
+		r.store.Put(c.Key, c.Value)
+	case "delete":
+		return r.store.Delete(c.Key)
+	}
+	return false
+}
+
+// apply is called by Raft, once per committed entry, in order, on every node.
+// This is where duplicates are caught: it is the one place where all nodes see
+// the same requests in the same order, so all nodes make the same decision.
 func (r *Replicated) apply(index, term int, command []byte) {
-	var existed bool
+	res := applyResult{term: term}
 	if len(command) > 0 { // empty = a new leader's no-op: nothing for the Store to do
 		var c Command
-		if err := json.Unmarshal(command, &c); err != nil {
+		switch err := json.Unmarshal(command, &c); {
+		case err != nil:
 			log.Printf("kv: skipping undecodable command at index %d: %v", index, err)
-		} else {
-			switch c.Op {
-			case "put":
-				r.store.Put(c.Key, c.Value)
-			case "delete":
-				existed = r.store.Delete(c.Key)
+		case c.ClientID == "":
+			res.existed = r.execute(c) // no request ID: applied every time it arrives
+		default:
+			s := r.sessions[c.ClientID]
+			switch {
+			case c.Seq > s.seq: // a new request: do it and remember the answer
+				res.existed = r.execute(c)
+				r.sessions[c.ClientID] = session{seq: c.Seq, existed: res.existed}
+			case c.Seq == s.seq: // a retry of the last one: repeat the answer, change nothing
+				res.existed = s.existed
+			default: // older than the last one: the client has moved on
+				res.stale = true
 			}
 		}
 	}
@@ -75,7 +116,7 @@ func (r *Replicated) apply(index, term int, command []byte) {
 	delete(r.waiters, index)
 	r.mu.Unlock()
 	if ch != nil {
-		ch <- applyResult{term: term, existed: existed}
+		ch <- res
 	}
 }
 
@@ -143,36 +184,84 @@ func (r *Replicated) submit(w http.ResponseWriter, req *http.Request, c Command)
 	return applyResult{}, false
 }
 
+// requestID reads the optional Client-Id and Request-Id headers. A client that
+// wants retries to be safe sends both, numbering its requests 1, 2, 3, ... and
+// re-sending the SAME number when it retries.
+func requestID(req *http.Request) (clientID string, seq int64, err error) {
+	clientID, raw := req.Header.Get("Client-Id"), req.Header.Get("Request-Id")
+	if clientID == "" && raw == "" {
+		return "", 0, nil
+	}
+	if clientID == "" || raw == "" {
+		return "", 0, errors.New("send both Client-Id and Request-Id, or neither")
+	}
+	if len(clientID) > 128 {
+		return "", 0, errors.New("Client-Id is too long (max 128 bytes)")
+	}
+	seq, err = strconv.ParseInt(raw, 10, 64)
+	if err != nil || seq < 1 {
+		return "", 0, errors.New("Request-Id must be a whole number, 1 or higher")
+	}
+	return clientID, seq, nil
+}
+
 func (r *Replicated) handlePut(w http.ResponseWriter, req *http.Request) {
+	clientID, seq, err := requestID(req)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
 	body, err := io.ReadAll(http.MaxBytesReader(w, req.Body, maxValueBytes))
 	if err != nil {
 		http.Error(w, "value too large or unreadable", http.StatusRequestEntityTooLarge)
 		return
 	}
-	if _, ok := r.submit(w, req, Command{Op: "put", Key: req.PathValue("key"), Value: string(body)}); ok {
-		w.WriteHeader(http.StatusNoContent)
-	}
-}
-
-func (r *Replicated) handleDelete(w http.ResponseWriter, req *http.Request) {
-	res, ok := r.submit(w, req, Command{Op: "delete", Key: req.PathValue("key")})
+	res, ok := r.submit(w, req, Command{Op: "put", Key: req.PathValue("key"), Value: string(body), ClientID: clientID, Seq: seq})
 	if !ok {
 		return
 	}
-	if !res.existed {
-		http.Error(w, "key not found", http.StatusNotFound)
+	if res.stale {
+		http.Error(w, "an older request than one this client already completed", http.StatusConflict)
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// handleGet is the NAIVE read: the leader answers from its own Store.
-// This is knowingly incomplete and is replaced in Stage 3. A leader that has
-// been cut off from the cluster, or whose Store has not yet applied the latest
-// committed writes, can return stale data here.
+func (r *Replicated) handleDelete(w http.ResponseWriter, req *http.Request) {
+	clientID, seq, err := requestID(req)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	res, ok := r.submit(w, req, Command{Op: "delete", Key: req.PathValue("key"), ClientID: clientID, Seq: seq})
+	if !ok {
+		return
+	}
+	switch {
+	case res.stale:
+		http.Error(w, "an older request than one this client already completed", http.StatusConflict)
+	case !res.existed:
+		http.Error(w, "key not found", http.StatusNotFound)
+	default:
+		w.WriteHeader(http.StatusNoContent)
+	}
+}
+
+// handleGet answers from the local Store, but only after Raft confirms that
+// this node is STILL the leader and has applied everything committed so far.
+// Without that check a leader that was cut off from the cluster would keep
+// answering from old data (see TestNaiveLeaderReadIsStaleAfterPartition).
 func (r *Replicated) handleGet(w http.ResponseWriter, req *http.Request) {
-	if r.node.Status().Role != raft.Leader {
+	ctx, cancel := context.WithTimeout(req.Context(), readTimeout)
+	defer cancel()
+	switch err := r.node.ConfirmRead(ctx); {
+	case err == nil:
+	case errors.Is(err, raft.ErrNotLeader):
 		r.notLeader(w, req)
+		return
+	default:
+		w.Header().Set("Retry-After", "1")
+		http.Error(w, "could not confirm this node is still the leader; retry", http.StatusServiceUnavailable)
 		return
 	}
 	v, ok := r.store.Get(req.PathValue("key"))
