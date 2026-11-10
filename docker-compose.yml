@@ -1,0 +1,63 @@
+# Three nodes, one container each, one named volume each.
+#
+#   docker compose up -d --build     start the cluster
+#   curl localhost:8081/raft/status  ask node 0 who is leader (8082, 8083 for the others)
+#   docker compose down              stop and remove the containers (the volumes STAY)
+#   docker compose down -v           ...and also delete the volumes (the nodes' memory!)
+#
+# Containers reach each other by service name (kv0, kv1, kv2) on port 8080.
+# Your own machine reaches them on ports 8081, 8082, 8083.
+# There is deliberately NO restart policy: when a container is killed it stays
+# dead until you start it, so you can watch what happens.
+
+name: raftkv
+
+x-node: &node
+  image: raft-kv:dev
+  build: .
+  stop_grace_period: 5s
+
+services:
+  kv0:
+    <<: *node
+    command:
+      - "-id=0"
+      - "-addr=:8080"
+      - "-data=/data"
+      - "-peers=http://kv0:8080,http://kv1:8080,http://kv2:8080"
+      - "-client-urls=http://localhost:8081,http://localhost:8082,http://localhost:8083"
+    ports:
+      - "8081:8080"
+    volumes:
+      - kv0-data:/data
+
+  kv1:
+    <<: *node
+    command:
+      - "-id=1"
+      - "-addr=:8080"
+      - "-data=/data"
+      - "-peers=http://kv0:8080,http://kv1:8080,http://kv2:8080"
+      - "-client-urls=http://localhost:8081,http://localhost:8082,http://localhost:8083"
+    ports:
+      - "8082:8080"
+    volumes:
+      - kv1-data:/data
+
+  kv2:
+    <<: *node
+    command:
+      - "-id=2"
+      - "-addr=:8080"
+      - "-data=/data"
+      - "-peers=http://kv0:8080,http://kv1:8080,http://kv2:8080"
+      - "-client-urls=http://localhost:8081,http://localhost:8082,http://localhost:8083"
+    ports:
+      - "8083:8080"
+    volumes:
+      - kv2-data:/data
+
+volumes:
+  kv0-data:
+  kv1-data:
+  kv2-data:

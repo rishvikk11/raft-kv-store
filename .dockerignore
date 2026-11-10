@@ -1,0 +1,9 @@
+# Keep the build context small: none of this is needed to build the server.
+.git
+data
+bench-results
+scripts
+PROGRESS.md
+Dockerfile
+docker-compose.yml
+**/*_test.go
