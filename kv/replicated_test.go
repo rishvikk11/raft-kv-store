@@ -17,20 +17,28 @@ import (
 )
 
 type liveCluster struct {
-	t    *testing.T
-	urls []string
-	dirs []string
-	reps []*Replicated
-	srvs []*http.Server
-	http *http.Client
+	t          *testing.T
+	urls       []string
+	dirs       []string
+	reps       []*Replicated
+	srvs       []*http.Server
+	http       *http.Client
+	noStepDown bool // fault-injection: leaders never give up on their own (see raft.Config.DisableStepDown)
+	// faults can cut the Raft messages between nodes (a network partition)
+	// without touching the clients' connections to them.
+	faults *faultNet
 }
 
-func startCluster(t *testing.T, n int) *liveCluster {
+func startCluster(t *testing.T, n int) *liveCluster { return startClusterWith(t, n, false) }
+
+func startClusterWith(t *testing.T, n int, noStepDown bool) *liveCluster {
 	t.Helper()
 	lc := &liveCluster{
-		t: t, urls: make([]string, n), dirs: make([]string, n),
+		noStepDown: noStepDown,
+		t:          t, urls: make([]string, n), dirs: make([]string, n),
 		reps: make([]*Replicated, n), srvs: make([]*http.Server, n),
-		http: &http.Client{Timeout: 8 * time.Second}, // follows 307 redirects, re-sending the body
+		http:   &http.Client{Timeout: 8 * time.Second}, // follows 307 redirects, re-sending the body
+		faults: newFaultNet(),
 	}
 	lns := make([]net.Listener, n)
 	for i := 0; i < n; i++ {
@@ -55,8 +63,10 @@ func startCluster(t *testing.T, n int) *liveCluster {
 
 func (lc *liveCluster) boot(i int, ln net.Listener) {
 	rep, err := NewReplicated(raft.Config{
-		ID: i, ClusterSize: len(lc.urls), Transport: raft.NewHTTPTransport(lc.urls), DataDir: lc.dirs[i],
+		ID: i, ClusterSize: len(lc.urls), DataDir: lc.dirs[i],
+		Transport:          faultTransport{inner: raft.NewHTTPTransport(lc.urls), from: i, net: lc.faults},
 		DisableFsync:       true,
+		DisableStepDown:    lc.noStepDown,
 		ElectionTimeoutMin: 150 * time.Millisecond, ElectionTimeoutMax: 300 * time.Millisecond,
 		HeartbeatInterval: 40 * time.Millisecond,
 	}, lc.urls)
