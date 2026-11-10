@@ -17,7 +17,7 @@ import (
 	"time"
 )
 
-// Role is what a node currently believes it is
+// Role is what a node currently believes it is.
 type Role int
 
 const (
@@ -134,9 +134,10 @@ type Node struct {
 	electionDeadline time.Time
 
 	// Leader-only state, rebuilt at each election win.
-	nextIndex  []int // per peer: next ledger index to send
-	matchIndex []int // per peer: highest index known stored there (self included)
-	kicks      []chan struct{}
+	nextIndex   []int // per peer: next ledger index to send
+	matchIndex  []int // per peer: highest index known stored there (self included)
+	kicks       []chan struct{}
+	lastContact []time.Time // per peer: when it last answered us (used to notice we are cut off)
 }
 
 func NewNode(cfg Config) (*Node, error) {
@@ -171,6 +172,7 @@ func NewNode(cfg Config) (*Node, error) {
 		savedTerm: st.term, savedVotedFor: st.votedFor,
 		role: Follower, leaderID: -1,
 		nextIndex: make([]int, cfg.ClusterSize), matchIndex: make([]int, cfg.ClusterSize),
+		lastContact: make([]time.Time, cfg.ClusterSize),
 	}
 	nd.applyCond = sync.NewCond(&nd.mu)
 	return nd, nil
@@ -311,8 +313,12 @@ func (nd *Node) ticker() {
 		case <-t.C:
 		}
 		nd.mu.Lock()
-		if !nd.stopped && nd.role != Leader && time.Now().After(nd.electionDeadline) {
-			nd.startElectionLocked()
+		if !nd.stopped {
+			if nd.role == Leader {
+				nd.checkQuorumLocked()
+			} else if time.Now().After(nd.electionDeadline) {
+				nd.startElectionLocked()
+			}
 		}
 		nd.mu.Unlock()
 	}
@@ -397,6 +403,7 @@ func (nd *Node) becomeLeaderLocked() {
 	for p := range nd.nextIndex {
 		nd.nextIndex[p] = nd.lastIndex() + 1
 		nd.matchIndex[p] = 0
+		nd.lastContact[p] = time.Now() // a fresh leader gets one timeout of grace
 	}
 	// First act: a no-op entry in the new term. Once it commits, everything
 	// before it commits too (see advanceCommitLocked for why we need this).
@@ -414,6 +421,31 @@ func (nd *Node) becomeLeaderLocked() {
 		go nd.replicate(p, nd.term, nd.kicks[p])
 	}
 	nd.advanceCommitLocked() // matters only for a 1-node cluster
+}
+
+// checkQuorumLocked is the leader's "can I still hear a majority?" test. If it
+// has heard from fewer than a majority of nodes (counting itself) within one
+// minimum election timeout, it can no longer be sure it is the leader: the
+// others may already have elected a replacement. So it steps down and stops
+// serving. The window matches the earliest moment a follower could start a
+// replacement election, so a cut-off leader quits about when it gets replaced.
+func (nd *Node) checkQuorumLocked() {
+	if nd.n == 1 {
+		return
+	}
+	cutoff := time.Now().Add(-nd.cfg.ElectionTimeoutMin)
+	heard := 1 // myself
+	for p := 0; p < nd.n; p++ {
+		if p != nd.id && nd.lastContact[p].After(cutoff) {
+			heard++
+		}
+	}
+	if heard*2 <= nd.n {
+		nd.logf("lost contact with a majority, stepping down")
+		nd.role = Follower
+		nd.leaderID = -1
+		nd.resetElectionTimerLocked()
+	}
 }
 
 // HandleRequestVote is the receiver side of RequestVote (Figure 2).
@@ -475,6 +507,9 @@ func (nd *Node) replicate(peer, term int, kick <-chan struct{}) {
 		}
 		sendAgain := false
 		if err == nil {
+			if reply.Term <= nd.term {
+				nd.lastContact[peer] = time.Now() // this follower is reachable and still follows us
+			}
 			switch {
 			case reply.Term > nd.term:
 				nd.becomeFollowerLocked(reply.Term)

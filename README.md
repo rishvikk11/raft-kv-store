@@ -7,7 +7,7 @@ Implemented from the Raft paper (raft.github.io/raft.pdf, mainly Figure 2) and p
 
 - [x] Stage 1: single-server store (in-memory store + HTTP interface, race-clean)
 - [x] Stage 2: Raft consensus (election, replication, safety rules, durable state, wired into the HTTP server)
-- [ ] Stage 3: linearizable reads, request IDs, leader step-down
+- [ ] Stage 3: leader step-down (done), linearizable reads (next), request IDs (after that)
 - [ ] Stage 4: fault-injection tests and measurements
 - [ ] Stage 5: Docker / Compose
 - [ ] Stage 6: local Kubernetes
@@ -36,19 +36,20 @@ A write that times out may or may not have been applied (the retry problem; Stag
 
 ## Design decisions
 
-| Decision                                                             | Why                                                                                                  | Tradeoff                                                                                              |
-| -------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------- |
-| `sync.RWMutex` around one map (Stage 1)                              | Simple, obviously correct                                                                            | One lock for the whole map                                                                            |
-| HTTP/JSON for both clients and Raft RPCs                             | Inspectable with curl, one port per node                                                             | More overhead than a binary protocol                                                                  |
-| One mutex guards all Raft state; fsync happens while holding it      | Easiest to reason about; the reply never leaves before the data is on disk                           | Disk latency blocks other handlers; first thing to revisit if Stage 4 measurements demand it          |
-| Append-only WAL with CRC frames: hard-state, entry, truncate records | Cheap appends; a half-written final record after a crash is detected and dropped                     | File only grows (no log compaction); mid-file corruption is a hard error rather than silent data loss |
-| Leader appends a no-op entry on election                             | Lets entries from earlier terms commit (Figure 8 rule) and gives Stage 3 reads a current-term anchor | One extra ledger entry per election                                                                   |
-| Commit only counts replicas of CURRENT-term entries                  | Figure 8: old-term entries can be overwritten even when a majority holds them                        | Old entries commit indirectly via the no-op                                                           |
-| Follower replies with ConflictIndex so the leader skips back quickly | Avoids stepping back one entry per round trip                                                        | Slightly more logic than the paper's basic version                                                    |
-| Randomized election timeout 300-600ms, heartbeat 75ms (defaults)     | Avoids split votes; heartbeat much shorter than timeout                                              | Failover takes roughly one timeout                                                                    |
-| Persist errors panic                                                 | A node that cannot save its promises must not keep running                                           | A full disk crashes the node                                                                          |
-| Apply callback runs on one goroutine, in order, outside the lock     | State machine sees every committed entry exactly once, in order                                      | Slow Apply delays later entries                                                                       |
-| GET in Stage 2 is a NAIVE leader-local read                          | Keeps Stage 2 focused; fixed in Stage 3                                                              | Can return stale data (see Known limitations)                                                         |
+| Decision                                                                                                 | Why                                                                                                                  | Tradeoff                                                                                                              |
+| -------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------- |
+| `sync.RWMutex` around one map (Stage 1)                                                                  | Simple, obviously correct                                                                                            | One lock for the whole map                                                                                            |
+| HTTP/JSON for both clients and Raft RPCs                                                                 | Inspectable with curl, one port per node                                                                             | More overhead than a binary protocol                                                                                  |
+| One mutex guards all Raft state; fsync happens while holding it                                          | Easiest to reason about; the reply never leaves before the data is on disk                                           | Disk latency blocks other handlers; first thing to revisit if Stage 4 measurements demand it                          |
+| Append-only WAL with CRC frames: hard-state, entry, truncate records                                     | Cheap appends; a half-written final record after a crash is detected and dropped                                     | File only grows (no log compaction); mid-file corruption is a hard error rather than silent data loss                 |
+| Leader appends a no-op entry on election                                                                 | Lets entries from earlier terms commit (Figure 8 rule) and gives Stage 3 reads a current-term anchor                 | One extra ledger entry per election                                                                                   |
+| Commit only counts replicas of CURRENT-term entries                                                      | Figure 8: old-term entries can be overwritten even when a majority holds them                                        | Old entries commit indirectly via the no-op                                                                           |
+| Follower replies with ConflictIndex so the leader skips back quickly                                     | Avoids stepping back one entry per round trip                                                                        | Slightly more logic than the paper's basic version                                                                    |
+| Randomized election timeout 300-600ms, heartbeat 75ms (defaults)                                         | Avoids split votes; heartbeat much shorter than timeout                                                              | Failover takes roughly one timeout                                                                                    |
+| Persist errors panic                                                                                     | A node that cannot save its promises must not keep running                                                           | A full disk crashes the node                                                                                          |
+| Apply callback runs on one goroutine, in order, outside the lock                                         | State machine sees every committed entry exactly once, in order                                                      | Slow Apply delays later entries                                                                                       |
+| Leader steps down if it has not heard from a majority within one minimum election timeout (check-quorum) | A cut-off leader stops accepting writes and stops claiming leadership at about the time a replacement can be elected | A leader can step down needlessly if replies are delayed or lost for a whole timeout; the cost is just a new election |
+| GET in Stage 2 is a NAIVE leader-local read                                                              | Keeps Stage 2 focused; fixed in Stage 3                                                                              | Can return stale data (see Known limitations)                                                                         |
 
 ## Not implemented (separate sections of the Raft paper)
 
@@ -58,7 +59,6 @@ A write that times out may or may not have been applied (the retry problem; Stag
 ## Known limitations (to fix in later stages)
 
 - Reads are not linearizable: a leader cut off from the majority, or one that has not yet applied the latest commits, can answer a GET with stale data. (Stage 3)
-- A leader that loses contact with a majority does not step down on its own. It steps down only when it hears a higher term. (Stage 3)
 - A client that times out and retries a write may apply it twice. (Stage 3: unique request IDs)
 
 ## How to run the tests
@@ -86,6 +86,7 @@ Add `data/` to .gitignore.
 - `go vet ./...` clean; `go test -race ./...`: 40 tests pass (kv: 17, raft: 23).
 - Repeated 8x in full and the chaos test 10x with random fault schedules: no failures, no data races.
 - Mutation check: each of these deliberate bugs makes at least one test fail: no election restriction, committing old-term entries by counting, committing without a majority, not persisting the vote, not persisting the log, accepting a stale leader's messages, truncating the log on a duplicate message.
+- Stage 3 step-down: new tests (cut-off leader steps down and refuses writes; only one leader claimed after a partition; leader with a majority keeps leading) pass. Breaking the check on purpose (never step down; step down unless hearing everyone) makes them fail. Full suite repeated 5x: no failures.
 - Manual: 3 separate processes with real fsync. Wrote through a follower, `kill -9` the leader, wrote and read during the outage, restarted the leader from disk; it rejoined as follower with commitIndex = lastApplied = 4.
 
 ## Measured numbers
