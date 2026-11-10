@@ -1,0 +1,22 @@
+== machine ==
+Darwin arm64
+cpu:    Apple M3
+cores:  8   macOS 26.6.2
+mode:   durable   nodes: 5   (all nodes run on this one machine)
+
+kvbench  go=go1.27.3  darwin/arm64  cpus=8
+cluster  nodes=5  leader=node 2 (term 1)  value=100B  request-ids=true  warmup=2s  measured=10s
+
+workload  clients    ops/sec    p50 ms    p95 ms    p99 ms    max ms  errors  checks
+write           1         98     10.08     13.93     16.25     20.01       0  ok (50 keys read back correctly)
+write           8        188     38.19     68.53     73.58     78.49       0  ok (400 keys read back correctly)
+write          32        208    142.62    270.29    300.47    317.51       0  ok (1600 keys read back correctly)
+write         128        215    585.00    776.93   1129.41   1210.76       0  ok (6400 keys read back correctly)
+read            1       5157      0.19      0.22      0.28     13.72       0  ok
+read            8      17661      0.45      0.57      0.69      5.32       0  ok
+read           32      31054      1.02      1.28      1.61      4.01       0  ok
+read          128      39360      3.25      3.85      4.31      6.27       0  ok
+mixed           1        800      0.47      8.24     11.37     16.57       0  ok (50 keys read back correctly)
+mixed           8       1152      5.93     17.10     21.17     29.70       0  ok (400 keys read back correctly)
+mixed          32       1629     19.36     32.16     40.94     65.93       0  ok (1600 keys read back correctly)
+mixed         128       2407     45.21    102.62    133.42    240.48       0  ok (6400 keys read back correctly)
