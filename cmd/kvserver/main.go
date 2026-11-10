@@ -13,16 +13,25 @@
 // inside a private network (for example Docker's kv1:8080), clients outside that
 // network cannot follow a redirect to such a name. -client-urls gives, in the
 // same order, the addresses clients should be redirected to instead.
+//
+// -forward makes a follower pass a request on to the leader itself instead of
+// redirecting the client, so a client can talk to any node. Use it behind a
+// load-balancing Service (Kubernetes).
+//
+// -id may be left out when the program runs as a Kubernetes StatefulSet pod: the
+// pod is named like "kv-2" and the number at the end becomes the node's ID.
 package main
 
 import (
 	"context"
 	"flag"
+	"fmt"
 	"log"
 	"net/http"
 	"net/url"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -31,9 +40,26 @@ import (
 	"github.com/rishvikk11/raft-kv-store/raft"
 )
 
+// ordinalFromHostname returns the number at the end of a StatefulSet pod name:
+// "kv-2" gives 2. Kubernetes gives each pod of a StatefulSet a fixed name ending
+// in its number, which is what makes a stable Raft identity possible.
+func ordinalFromHostname(host string) (int, error) {
+	bad := fmt.Errorf("hostname %q does not end in -<number>", host)
+	i := strings.LastIndex(host, "-")
+	if i <= 0 || i == len(host)-1 || host[i-1] == '-' {
+		return 0, bad
+	}
+	n, err := strconv.ParseUint(host[i+1:], 10, 31) // digits only: no sign, no spaces
+	if err != nil {
+		return 0, bad
+	}
+	return int(n), nil
+}
+
 func main() {
 	addr := flag.String("addr", "", "listen address (cluster default: taken from this node's -peers URL; standalone default :8080)")
-	id := flag.Int("id", 0, "this node's index in -peers")
+	id := flag.Int("id", -1, "this node's index in -peers (default: the number at the end of this machine's hostname, for Kubernetes StatefulSets)")
+	forward := flag.Bool("forward", false, "a follower passes requests on to the leader instead of redirecting the client")
 	peers := flag.String("peers", "", "comma-separated base URLs of all nodes in ID order; empty runs standalone without Raft")
 	clientURLs := flag.String("client-urls", "", "comma-separated URLs clients use to reach each node, in ID order, used for redirects (default: same as -peers)")
 	data := flag.String("data", "", "directory for this node's Raft state (required with -peers)")
@@ -51,7 +77,19 @@ func main() {
 	}
 
 	urls := strings.Split(*peers, ",")
-	if *id < 0 || *id >= len(urls) {
+	if *id < 0 {
+		host, err := os.Hostname()
+		if err != nil {
+			log.Fatalf("no -id given and cannot read the hostname: %v", err)
+		}
+		n, err := ordinalFromHostname(host)
+		if err != nil {
+			log.Fatalf("no -id given and %v", err)
+		}
+		*id = n
+		log.Printf("node ID %d taken from hostname %q", *id, host)
+	}
+	if *id >= len(urls) {
 		log.Fatalf("-id %d is out of range for %d peers", *id, len(urls))
 	}
 	if *data == "" {
@@ -83,6 +121,9 @@ func main() {
 	}
 	if err != nil {
 		log.Fatal(err)
+	}
+	if *forward {
+		rep.EnableForwarding(urls)
 	}
 	srv := &http.Server{Addr: listen, Handler: rep.Handler(), ReadHeaderTimeout: 5 * time.Second}
 	rep.Start()

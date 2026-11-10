@@ -6,12 +6,16 @@ package kv
 // committed entries in the same order, so every node's Store ends up identical.
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"io"
 	"log"
+	"net"
 	"net/http"
+	"net/http/httputil"
+	"net/url"
 	"strconv"
 	"sync"
 	"time"
@@ -22,6 +26,11 @@ import (
 const (
 	commitTimeout = 5 * time.Second
 	readTimeout   = 2 * time.Second
+
+	// forwardedHeader marks a request that a follower has already passed on. A
+	// node that receives such a request and is not the leader answers "try again"
+	// instead of passing it on a second time, so a request can never bounce around.
+	forwardedHeader = "X-Kv-Forwarded"
 )
 
 // Command is what goes into the Raft ledger. ClientID and Seq identify a
@@ -56,6 +65,11 @@ type Replicated struct {
 	// by applying the same entries in the same order. Only apply() touches it.
 	sessions map[string]session
 
+	// If set, a follower passes requests on to the leader (using these node-to-node
+	// addresses) instead of redirecting the client. See EnableForwarding.
+	forwardTo        []string
+	forwardTransport *http.Transport
+
 	mu      sync.Mutex
 	waiters map[int]chan applyResult // HTTP requests waiting for a ledger index to be applied
 }
@@ -74,6 +88,19 @@ func NewReplicated(cfg raft.Config, clientURLs []string) (*Replicated, error) {
 	}
 	r.node = node
 	return r, nil
+}
+
+// EnableForwarding makes a follower pass a client's request on to the leader
+// itself, over the nodes' own addresses, instead of telling the client to go
+// there. The client can then talk to ANY node, which is what a load-balancing
+// Service in front of the cluster needs. nodeURLs[i] is how nodes reach node i.
+func (r *Replicated) EnableForwarding(nodeURLs []string) {
+	r.forwardTo = nodeURLs
+	r.forwardTransport = &http.Transport{
+		DialContext:           (&net.Dialer{Timeout: time.Second}).DialContext,
+		ResponseHeaderTimeout: commitTimeout + 3*time.Second, // the leader may wait for a commit
+		MaxIdleConnsPerHost:   64,
+	}
 }
 
 func (r *Replicated) Start() { r.node.Start() }
@@ -133,9 +160,41 @@ func (r *Replicated) Handler() http.Handler {
 	return mux
 }
 
-// notLeader sends the client to the leader if we know it, else asks it to retry.
+// forward passes the request on to the leader and relays its answer. Any
+// failure becomes a 503, which clients already know means "retry".
+func (r *Replicated) forward(w http.ResponseWriter, req *http.Request, self, leader int) {
+	if req.Header.Get(forwardedHeader) != "" {
+		w.Header().Set("Retry-After", "1")
+		http.Error(w, "leadership changed while this request was being passed on; retry", http.StatusServiceUnavailable)
+		return
+	}
+	target, err := url.Parse(r.forwardTo[leader])
+	if err != nil {
+		http.Error(w, "bad leader address", http.StatusServiceUnavailable)
+		return
+	}
+	(&httputil.ReverseProxy{
+		Rewrite: func(pr *httputil.ProxyRequest) {
+			pr.SetURL(target)
+			pr.Out.Header.Set(forwardedHeader, strconv.Itoa(self))
+		},
+		Transport: r.forwardTransport,
+		ErrorHandler: func(w http.ResponseWriter, _ *http.Request, err error) {
+			w.Header().Set("Retry-After", "1")
+			http.Error(w, "could not reach the leader; retry", http.StatusServiceUnavailable)
+		},
+	}).ServeHTTP(w, req)
+}
+
+// notLeader deals with a request this node cannot serve because it is not the
+// leader: pass it on (if forwarding is on), else redirect the client, else ask
+// it to retry.
 func (r *Replicated) notLeader(w http.ResponseWriter, req *http.Request) {
 	st := r.node.Status()
+	if r.forwardTo != nil && st.LeaderID >= 0 && st.LeaderID != st.ID && st.LeaderID < len(r.forwardTo) {
+		r.forward(w, req, st.ID, st.LeaderID)
+		return
+	}
 	if st.LeaderID >= 0 && st.LeaderID != st.ID && st.LeaderID < len(r.peers) {
 		http.Redirect(w, req, r.peers[st.LeaderID]+req.URL.RequestURI(), http.StatusTemporaryRedirect)
 		return
@@ -220,6 +279,10 @@ func (r *Replicated) handlePut(w http.ResponseWriter, req *http.Request) {
 		http.Error(w, "value too large or unreadable", http.StatusRequestEntityTooLarge)
 		return
 	}
+	// We have read the body, but if this node turns out not to be the leader the
+	// request may have to be passed on, so put the body back.
+	req.Body = io.NopCloser(bytes.NewReader(body))
+	req.ContentLength = int64(len(body))
 	res, ok := r.submit(w, req, Command{Op: "put", Key: req.PathValue("key"), Value: string(body), ClientID: clientID, Seq: seq})
 	if !ok {
 		return

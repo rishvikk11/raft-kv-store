@@ -24,7 +24,8 @@ type liveCluster struct {
 	srvs       []*http.Server
 	http       *http.Client
 	clientURLs []string // what followers redirect clients to; nil means the same URLs the nodes use
-	noStepDown bool     // fault-injection: leaders never give up on their own (see raft.Config.DisableStepDown)
+	forward    bool
+	noStepDown bool // fault-injection: leaders never give up on their own (see raft.Config.DisableStepDown)
 	// faults can cut the Raft messages between nodes (a network partition)
 	// without touching the clients' connections to them.
 	faults *faultNet
@@ -34,14 +35,22 @@ func startCluster(t *testing.T, n int) *liveCluster { return startClusterWith(t,
 
 func startClusterWith(t *testing.T, n int, noStepDown bool) *liveCluster {
 	t.Helper()
-	return startClusterOpts(t, n, noStepDown, nil)
+	return startClusterOpts(t, n, clusterOpts{noStepDown: noStepDown})
 }
 
-func startClusterOpts(t *testing.T, n int, noStepDown bool, clientURLs []string) *liveCluster {
+type clusterOpts struct {
+	noStepDown bool
+	clientURLs []string // what followers redirect clients to; nil means the nodes' own URLs
+	forward    bool     // followers pass requests on to the leader instead of redirecting
+}
+
+func startClusterOpts(t *testing.T, n int, o clusterOpts) *liveCluster {
 	t.Helper()
+	noStepDown, clientURLs := o.noStepDown, o.clientURLs
 	lc := &liveCluster{
 		noStepDown: noStepDown,
 		clientURLs: clientURLs,
+		forward:    o.forward,
 		t:          t, urls: make([]string, n), dirs: make([]string, n),
 		reps: make([]*Replicated, n), srvs: make([]*http.Server, n),
 		http:   &http.Client{Timeout: 8 * time.Second}, // follows 307 redirects, re-sending the body
@@ -86,6 +95,9 @@ func (lc *liveCluster) boot(i int, ln net.Listener) {
 	}, lc.redirectURLs())
 	if err != nil {
 		lc.t.Fatal(err)
+	}
+	if lc.forward {
+		rep.EnableForwarding(lc.urls)
 	}
 	srv := &http.Server{Handler: rep.Handler()}
 	go srv.Serve(ln)
