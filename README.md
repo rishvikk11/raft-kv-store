@@ -9,7 +9,7 @@ Implemented from the Raft paper (raft.github.io/raft.pdf, mainly Figure 2) and p
 - [x] Stage 2: Raft consensus (election, replication, safety rules, durable state, wired into the HTTP server)
 - [x] Stage 3: leader step-down, linearizable reads (read-index), request IDs for safe retries
 - [x] Stage 4: fault-injection tests, self-checking measuring tool, and measured numbers on the author's laptop
-- [ ] Stage 5: Docker / Compose
+- [x] Stage 5: Docker / Compose: image, 3-node cluster with one volume each, and a kill-and-recover proof (13 checks) all verified on the author's machine
 - [ ] Stage 6: local Kubernetes
 
 ## Layout
@@ -23,23 +23,29 @@ Implemented from the Raft paper (raft.github.io/raft.pdf, mainly Figure 2) and p
     raft/http.go           Raft messages over HTTP/JSON between nodes (+ /raft/status)
     cmd/kvbench/main.go    load generator: measures throughput and latency, then checks its own work
     scripts/bench.sh       one command: builds, starts N nodes, runs kvbench, saves results
+    Dockerfile             multi-stage build: compile in a Go image, ship only the program in an empty image
+    docker-compose.yml     3 nodes, one container and one named volume each
+    cmd/kvproof/main.go    runs the kill-and-recover experiment against the Docker cluster; prints PASS/FAIL
     *_test.go              see "Codebase map" below
 
 ## Codebase map
 
 Every non-test file answers one question.
 
-| File                   | Its one job                                                                                                                      |
-| ---------------------- | -------------------------------------------------------------------------------------------------------------------------------- |
-| `kv/store.go`          | Hold key-value pairs safely under many goroutines                                                                                |
-| `kv/server.go`         | Single-server HTTP onto the Store, no Raft                                                                                       |
-| `kv/replicated.go`     | Turn a write into a Raft command, wait until it is committed, then apply it to the Store; confirm reads; drop duplicate requests |
-| `raft/raft.go`         | Decide who leads, copy the ledger, decide what is committed, step down, confirm reads                                            |
-| `raft/wal.go`          | Save term, vote and ledger to disk before any reply; replay on restart                                                           |
-| `raft/http.go`         | Carry Raft messages between nodes; serve /raft/status                                                                            |
-| `cmd/kvserver/main.go` | Parse flags, build the pieces, start the server                                                                                  |
-| `cmd/kvbench/main.go`  | Send load to the leader from many clients, record every latency, read back what was written to prove the run was valid           |
-| `scripts/bench.sh`     | Build, start 3 or 5 nodes with real fsync, run kvbench, save the results                                                         |
+| File                          | Its one job                                                                                                                      |
+| ----------------------------- | -------------------------------------------------------------------------------------------------------------------------------- |
+| `kv/store.go`                 | Hold key-value pairs safely under many goroutines                                                                                |
+| `kv/server.go`                | Single-server HTTP onto the Store, no Raft                                                                                       |
+| `kv/replicated.go`            | Turn a write into a Raft command, wait until it is committed, then apply it to the Store; confirm reads; drop duplicate requests |
+| `raft/raft.go`                | Decide who leads, copy the ledger, decide what is committed, step down, confirm reads                                            |
+| `raft/wal.go`                 | Save term, vote and ledger to disk before any reply; replay on restart                                                           |
+| `raft/http.go`                | Carry Raft messages between nodes; serve /raft/status                                                                            |
+| `cmd/kvserver/main.go`        | Parse flags, build the pieces, start the server                                                                                  |
+| `cmd/kvbench/main.go`         | Send load to the leader from many clients, record every latency, read back what was written to prove the run was valid           |
+| `scripts/bench.sh`            | Build, start 3 or 5 nodes with real fsync, run kvbench, save the results                                                         |
+| `Dockerfile`, `.dockerignore` | Build a tiny image containing only the server program                                                                            |
+| `docker-compose.yml`          | Run 3 nodes, one container each, each with its own volume holding its Raft state                                                 |
+| `cmd/kvproof/main.go`         | Kill a container mid-traffic, restart it, replace it, and check nothing acknowledged was lost                                    |
 
 **Who knows about whom.** `store.go` knows nothing. `raft/` knows nothing about keys or values; it talks to the outside through an Apply callback (committed commands come out) and a Transport (messages go to other nodes). `replicated.go` is the only file that knows both Raft and the Store. `wal.go` is used only by `raft.go`.
 
@@ -59,20 +65,21 @@ A GET is shorter: `handleGet` calls `ConfirmRead` (raft.go), then `Get` on the S
 
 **Tests, by what they pretend.**
 
-| File                                          | What it checks                                                           |
-| --------------------------------------------- | ------------------------------------------------------------------------ |
-| `raft/harness_test.go`                        | Not tests: the fake network and cluster helpers the other raft tests use |
-| `raft/election_test.go`                       | One leader appears; a new one after a failure                            |
-| `raft/replication_test.go`                    | Ledgers match; conflicting entries are overwritten; lossy network        |
-| `raft/rules_test.go`                          | Individual Raft rules, no network                                        |
-| `raft/persistence_test.go`                    | Crash and restart; the randomized chaos test                             |
-| `raft/wal_test.go`                            | The disk file: half-written and damaged records                          |
-| `raft/stepdown_test.go`                       | A cut-off leader gives up                                                |
-| `raft/read_test.go`, `raft/readindex_test.go` | Stale reads vs safe reads; each step of read-index                       |
-| `kv/store_test.go`, `kv/server_test.go`       | Stage 1 basics                                                           |
-| `kv/replicated_test.go`                       | Three real servers on real ports, real disks                             |
-| `kv/dedupe_test.go`                           | Retried requests are not applied twice                                   |
-| `kv/history_test.go`, `kv/faults_test.go`     | Stage 4: fault injection under live traffic and the correctness checker  |
+| File                                          | What it checks                                                               |
+| --------------------------------------------- | ---------------------------------------------------------------------------- |
+| `raft/harness_test.go`                        | Not tests: the fake network and cluster helpers the other raft tests use     |
+| `raft/election_test.go`                       | One leader appears; a new one after a failure                                |
+| `raft/replication_test.go`                    | Ledgers match; conflicting entries are overwritten; lossy network            |
+| `raft/rules_test.go`                          | Individual Raft rules, no network                                            |
+| `raft/persistence_test.go`                    | Crash and restart; the randomized chaos test                                 |
+| `raft/wal_test.go`                            | The disk file: half-written and damaged records                              |
+| `raft/stepdown_test.go`                       | A cut-off leader gives up                                                    |
+| `raft/read_test.go`, `raft/readindex_test.go` | Stale reads vs safe reads; each step of read-index                           |
+| `kv/store_test.go`, `kv/server_test.go`       | Stage 1 basics                                                               |
+| `kv/replicated_test.go`                       | Three real servers on real ports, real disks                                 |
+| `kv/dedupe_test.go`                           | Retried requests are not applied twice                                       |
+| `kv/redirect_test.go`                         | Followers redirect clients to the client-facing address, not the private one |
+| `kv/history_test.go`, `kv/faults_test.go`     | Stage 4: fault injection under live traffic and the correctness checker      |
 
 ## Architecture
 
@@ -125,6 +132,89 @@ Retries: a request may carry Client-Id and Request-Id headers; duplicates are fi
 
 **Lesson learned.** The first version of the workload used a 3 s client timeout. Requests stuck on a cut-off leader then blocked every writer for the whole partition, so no write was acknowledged while the old leader served reads and a stale-read bug went unnoticed. Client timeout is now 600 ms so stuck requests retry elsewhere.
 
+## Docker (Stage 5)
+
+### The ideas, in plain language
+
+- **Image**: a frozen, sealed snapshot of a program plus the files it needs, read-only. Like a recipe with the ingredients photographed so anyone can make the same dish. Ours is `raft-kv:dev`.
+- **Layers**: an image is a stack of transparent sheets. Each line of the Dockerfile adds a sheet. If nothing that went into a sheet has changed, Docker reuses it instead of rebuilding, so the things that change least go first.
+- **Container**: a running copy made from an image, like a cake baked from the recipe. It gets its own thin scratch layer to write on. Delete the container and the scratch layer goes with it.
+- **Volume**: a separate drawer that lives outside any container. Plugging a volume in at `/data` means everything written to `/data` goes into the drawer. Delete the container and the drawer, with the notebook inside, stays. A new container plugged into the same drawer finds the same notebook.
+- **Multi-stage build**: stage 1 is a big kitchen (the whole Go toolchain) that cooks the program; stage 2 is an empty plate that receives only the finished program. The final image is the program plus nothing else (about 5.6 MB of program in an image with no shell, no tools, no operating system files).
+- **Why the volume, not the container, survives a crash**: each node writes its term, its vote and its ledger to `/data` before replying to anyone. `/data` is a volume. The container's own layer is disposable by design. So the ledger outlives any container, whether it was killed, stopped or deleted.
+
+### Files
+
+`Dockerfile` (build), `.dockerignore` (keeps the build small), `docker-compose.yml` (3 services `kv0`..`kv2`, volumes `kv0-data`..`kv2-data`, ports 8081..8083 on the host), `cmd/kvproof` (the experiment).
+Containers reach each other as `kv0:8080`, `kv1:8080`, `kv2:8080` on Docker's private network. Those names only exist there, so `-client-urls` tells followers to redirect outside clients to `localhost:808x` instead. No restart policy on purpose, so a killed container stays dead until you start it.
+
+### How to run
+
+    docker compose up -d --build            # start the cluster
+    curl -s localhost:8081/raft/status      # who is leader? (8082, 8083 for the others)
+    curl -L -X PUT localhost:8082/kv/alice -d 42
+    curl -L localhost:8083/kv/alice
+    docker compose down                     # remove containers, KEEP volumes
+    docker compose down -v                  # remove containers AND volumes (erases the nodes' memory)
+    go run ./cmd/kvproof                    # the experiment (starts from a clean slate; deletes the raftkv volumes first)
+
+### What `kvproof` does and checks (13 checks)
+
+1. Starts 3 containers; checks all reachable and a leader is elected.
+2. Starts 4 writers; checks writes flow. A write only counts once the cluster acknowledges it; retries reuse the same request number.
+3. `docker kill` (SIGKILL) the leader mid-traffic. The clock for "while it was down" starts only once the node is CONFIRMED down, because the kill command itself takes a moment and writes keep flowing until the process really dies.
+4. Checks a new leader (higher term) was elected without it, and that at least 50 writes were acknowledged while it stayed down for at least 3 s.
+5. `docker compose start` the same container. Checks that, on startup, the node **read back from its own volume** at least the ledger entries it had before the kill, and its term (`recoveredEntries` / `recoveredTerm` in `/raft/status`); that the cluster had moved AHEAD of what the volume held (so catching up is real work); and that it caught up.
+6. `docker compose rm -sf` deletes the container, then `up` creates a brand-new one on the same volume. Checks it reads back the ledger, including the entries it received AFTER the first restart, and catches up again.
+7. Stops writing; checks all three nodes end with identical, fully applied ledgers, and that every acknowledged write is still in the cluster.
+   It also prints what it measured: total writes acknowledged, how many while the node was down, and how long until a new leader was found. If anything fails, the cluster is left running and the recent logs are printed.
+
+### What has and has not been verified
+
+Verified by the author's first real Docker run (2026-11-10, Docker Desktop on an Apple M3): the image builds (the `golang:1.27` tag exists), the volumes are created and writable by user 65532, the nodes find each other by service name, and `docker kill`, `start`, `rm -sf` and `up` behave as the proof expects. All 11 checks of the first version of the proof passed.
+
+What that first run genuinely proved: after a SIGKILL, `kv2` read 211 ledger entries from its own volume (a wiped volume reads 0); a brand-new container created after `docker compose rm` read the same 211; at the end all three nodes were identical and all 210 acknowledged writes were present.
+
+What the first run did NOT prove, found by reading its output (all fixed in the current `kvproof`):
+
+- "92 more writes acknowledged while the node was down" counted writes made before the node actually died (the node had 118 entries when its status was read but 211 on disk at death, so about 93 writes landed during the kill command itself).
+- "Caught up (leader had committed 0 entries)": no leader was found at that instant, so the check compared against zero and passed automatically.
+- Step 6 began before the node had caught up, and the whole experiment took about 2 seconds, too short to show the cluster working while the node was down.
+  The same weaknesses were reproduced in the stand-in first: killing a second node (no majority, so no writes possible) still made the old proof print "PASS writes were still acknowledged"; the current proof fails that case at step 4, fails a wiped volume at step 5, and passes the healthy case on every run.
+
+Verified without Docker (sandbox): the server compiles from exactly the files the Dockerfile copies, as a static 5.6 MB program, and runs in an EMPTY root filesystem as user 65532: serves requests, writes its WAL, shuts down cleanly on SIGTERM, recovers its data after SIGKILL on the same folder, and gives a clear `permission denied` if the data folder has the wrong owner. `docker-compose.yml` is internally consistent. `kvproof`'s logic was tested against a stand-in `docker` command that runs real server processes on real directories.
+
+### If something goes wrong
+
+- Build says the Go toolchain is too old or the image is not found: change `ARG GO_VERSION` at the top of the Dockerfile to match `go version` on your machine.
+- `docker compose logs kv0` shows `permission denied` on `/data/raft.wal`: the volume is owned by root. Run `docker compose down -v` and try again (a new empty volume copies ownership from the image). As a last resort add `user: "0"` under the services.
+- Ports 8081 to 8083 already in use: stop the other program using them.
+- A redirect fails: use `curl -L`, and check `-client-urls` in the compose file.
+
+### What this does and does not prove
+
+`docker kill` crashes the PROCESS. It shows a crashed node recovers from its volume and that deleting a container loses nothing. It does not show survival of a power cut or machine crash. On Docker Desktop the volume lives on a disk file inside a Linux VM, so whether an fsync reaches the Mac's physical disk before a power cut depends on Docker Desktop and is untested here. A node whose volume is DELETED comes back blank with the same identity; Raft does not make that safe (it may have forgotten votes and entries it already acknowledged), so it must be treated as a dead member. Stage 6 covers this.
+
+### Proof run on the author's machine
+
+Docker Desktop on an Apple M3, 2026-11-10, current `kvproof` (13 checks): **13 passed, 0 failed.** Killed node: `kv1`, which was the leader. One run.
+
+| What                                                               | Measured                                                                                              |
+| ------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------- |
+| New leader after the kill                                          | node 0, term 2, found 272 ms after `kv1` was confirmed down                                           |
+| Writes acknowledged while `kv1` was down (3 s)                     | 519                                                                                                   |
+| Writes acknowledged in total                                       | 969 (all present at the end, 0 missing, 0 wrong)                                                      |
+| `kv1`'s ledger just before the kill (last status read)             | 61 entries                                                                                            |
+| What `kv1` read from its own volume on restart                     | 147 entries, term 1 (more than 61 because writes landed during the kill command itself)               |
+| Cluster's committed entries when `kv1` restarted                   | 714                                                                                                   |
+| `kv1` caught up                                                    | in 60 ms, ledger 147 to 796                                                                           |
+| Brand-new container after `docker compose rm` read from the volume | 877 entries, term 2 (the first restart had read 147, so the volume also held what was saved after it) |
+| End state                                                          | all three nodes identical and fully applied                                                           |
+
+Notes on reading these: the 272 ms is measured from the moment the node was confirmed down, by polling every 50 ms, so it is approximate; it is consistent with the configured election timeout of 300 to 600 ms, which starts counting from the last heartbeat. It is a single sample, not an average. Throughput during this run is not a benchmark: the writers are sequential clients and the proof also polls and runs Docker commands.
+
+What this does NOT show: survival of a power cut or machine crash (`docker kill` crashes a process; on Docker Desktop the volume sits on a disk file inside a Linux VM, and whether fsync reaches the Mac's physical disk is untested); behaviour with a deleted volume (that node would come back blank, which Raft does not make safe; Stage 6); more than one run.
+
 ## Not implemented (separate sections of the Raft paper)
 
 - Log compaction / snapshots (paper section 7): the WAL grows forever.
@@ -159,7 +249,7 @@ Add `data/` to .gitignore.
 
 ## Current test results (Go 1.22.2, race detector on)
 
-- `go vet ./...` clean; `go test -race ./...`: 71 tests pass (kv: 33, raft: 38). Includes a 5-node test (survives 2 failures, refuses to commit with 3 down).
+- `go vet ./...` clean; `go test -race ./...`: 73 tests pass (kv: 34, raft: 39). Includes a 5-node test (survives 2 failures, refuses to commit with 3 down).
 - Repeated 8x in full and the chaos test 10x with random fault schedules: no failures, no data races.
 - Mutation check: each of these deliberate bugs makes at least one test fail: no election restriction, committing old-term entries by counting, committing without a majority, not persisting the vote, not persisting the log, accepting a stale leader's messages, truncating the log on a duplicate message.
 - Stage 3 step-down: new tests (cut-off leader steps down and refuses writes; only one leader claimed after a partition; leader with a majority keeps leading) pass. Breaking the check on purpose (never step down; step down unless hearing everyone) makes them fail. Full suite repeated 5x: no failures.
