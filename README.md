@@ -8,7 +8,7 @@ Implemented from the Raft paper (raft.github.io/raft.pdf, mainly Figure 2) and p
 - [x] Stage 1: single-server store (in-memory store + HTTP interface, race-clean)
 - [x] Stage 2: Raft consensus (election, replication, safety rules, durable state, wired into the HTTP server)
 - [x] Stage 3: leader step-down, linearizable reads (read-index), request IDs for safe retries
-- [~] Stage 4: fault-injection tests (done); throughput/latency measurements (next)
+- [x] Stage 4: fault-injection tests, self-checking measuring tool, and measured numbers on the author's laptop
 - [ ] Stage 5: Docker / Compose
 - [ ] Stage 6: local Kubernetes
 
@@ -21,6 +21,8 @@ Implemented from the Raft paper (raft.github.io/raft.pdf, mainly Figure 2) and p
     raft/raft.go           the Raft rules: election, replication, commit, step-down, ConfirmRead
     raft/wal.go            write-ahead log: durable term, vote and ledger
     raft/http.go           Raft messages over HTTP/JSON between nodes (+ /raft/status)
+    cmd/kvbench/main.go    load generator: measures throughput and latency, then checks its own work
+    scripts/bench.sh       one command: builds, starts N nodes, runs kvbench, saves results
     *_test.go              see "Codebase map" below
 
 ## Codebase map
@@ -36,6 +38,8 @@ Every non-test file answers one question.
 | `raft/wal.go`          | Save term, vote and ledger to disk before any reply; replay on restart                                                           |
 | `raft/http.go`         | Carry Raft messages between nodes; serve /raft/status                                                                            |
 | `cmd/kvserver/main.go` | Parse flags, build the pieces, start the server                                                                                  |
+| `cmd/kvbench/main.go`  | Send load to the leader from many clients, record every latency, read back what was written to prove the run was valid           |
+| `scripts/bench.sh`     | Build, start 3 or 5 nodes with real fsync, run kvbench, save the results                                                         |
 
 **Who knows about whom.** `store.go` knows nothing. `raft/` knows nothing about keys or values; it talks to the outside through an Apply callback (committed commands come out) and a Transport (messages go to other nodes). `replicated.go` is the only file that knows both Raft and the Store. `wal.go` is used only by `raft.go`.
 
@@ -83,24 +87,24 @@ Retries: a request may carry Client-Id and Request-Id headers; duplicates are fi
 
 ## Design decisions
 
-| Decision                                                                                                                                                                                                              | Why                                                                                                                                  | Tradeoff                                                                                                              |
-| --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------- |
-| `sync.RWMutex` around one map (Stage 1)                                                                                                                                                                               | Simple, obviously correct                                                                                                            | One lock for the whole map                                                                                            |
-| HTTP/JSON for both clients and Raft RPCs                                                                                                                                                                              | Inspectable with curl, one port per node                                                                                             | More overhead than a binary protocol                                                                                  |
-| One mutex guards all Raft state; fsync happens while holding it                                                                                                                                                       | Easiest to reason about; the reply never leaves before the data is on disk                                                           | Disk latency blocks other handlers; first thing to revisit if Stage 4 measurements demand it                          |
-| Append-only WAL with CRC frames: hard-state, entry, truncate records                                                                                                                                                  | Cheap appends; a half-written final record after a crash is detected and dropped                                                     | File only grows (no log compaction); mid-file corruption is a hard error rather than silent data loss                 |
-| Leader appends a no-op entry on election                                                                                                                                                                              | Lets entries from earlier terms commit (Figure 8 rule) and gives Stage 3 reads a current-term anchor                                 | One extra ledger entry per election                                                                                   |
-| Commit only counts replicas of CURRENT-term entries                                                                                                                                                                   | Figure 8: old-term entries can be overwritten even when a majority holds them                                                        | Old entries commit indirectly via the no-op                                                                           |
-| Follower replies with ConflictIndex so the leader skips back quickly                                                                                                                                                  | Avoids stepping back one entry per round trip                                                                                        | Slightly more logic than the paper's basic version                                                                    |
-| Randomized election timeout 300-600ms, heartbeat 75ms (defaults)                                                                                                                                                      | Avoids split votes; heartbeat much shorter than timeout                                                                              | Failover takes roughly one timeout                                                                                    |
-| Persist errors panic                                                                                                                                                                                                  | A node that cannot save its promises must not keep running                                                                           | A full disk crashes the node                                                                                          |
-| Apply callback runs on one goroutine, in order, outside the lock                                                                                                                                                      | State machine sees every committed entry exactly once, in order                                                                      | Slow Apply delays later entries                                                                                       |
-| Leader steps down if it has not heard from a majority within one minimum election timeout (check-quorum)                                                                                                              | A cut-off leader stops accepting writes and stops claiming leadership at about the time a replacement can be elected                 | A leader can step down needlessly if replies are delayed or lost for a whole timeout; the cost is just a new election |
-| Reads use read-index (ConfirmRead): wait for a commit in the leader's own term, note the commit index, get a majority to answer a heartbeat sent AFTER the read arrived, wait for the Store to apply up to that index | Linearizable reads without writing every read into the log; does not depend on clocks                                                | Each read costs a round trip to a majority; a leader that cannot reach a majority refuses (503) instead of answering  |
-| Only replies to heartbeats built after the read count as confirmation                                                                                                                                                 | A reply to an older heartbeat only proves we led at some earlier moment                                                              | Slightly more bookkeeping (a counter on each heartbeat)                                                               |
-| Request IDs = Client-Id + a per-client counter (Request-Id 1, 2, 3...); the cluster remembers each client's last request number and its answer                                                                        | Bounded memory, simple to explain, and a retry is recognised even by a new leader because the memory is part of the replicated state | One outstanding request per client ID; the table grows with the number of clients and never expires                   |
-| Duplicates are filtered at APPLY time, not when the request arrives                                                                                                                                                   | Apply is the one place every node sees the same requests in the same order                                                           | A retry still takes a (cheap) slot in the ledger                                                                      |
-| Request IDs are optional                                                                                                                                                                                              | Easy to use with plain curl                                                                                                          | Without them a retried write can be applied twice (a test shows this on purpose)                                      |
+| Decision                                                                                                                                                                                                              | Why                                                                                                                                  | Tradeoff                                                                                                                    |
+| --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------- |
+| `sync.RWMutex` around one map (Stage 1)                                                                                                                                                                               | Simple, obviously correct                                                                                                            | One lock for the whole map                                                                                                  |
+| HTTP/JSON for both clients and Raft RPCs                                                                                                                                                                              | Inspectable with curl, one port per node                                                                                             | More overhead than a binary protocol                                                                                        |
+| One mutex guards all Raft state; fsync happens while holding it                                                                                                                                                       | Easiest to reason about; the reply never leaves before the data is on disk                                                           | Disk latency blocks other handlers. Stage 4 measured the effect: durable writes top out around 230/s (see Measured numbers) |
+| Append-only WAL with CRC frames: hard-state, entry, truncate records                                                                                                                                                  | Cheap appends; a half-written final record after a crash is detected and dropped                                                     | File only grows (no log compaction); mid-file corruption is a hard error rather than silent data loss                       |
+| Leader appends a no-op entry on election                                                                                                                                                                              | Lets entries from earlier terms commit (Figure 8 rule) and gives Stage 3 reads a current-term anchor                                 | One extra ledger entry per election                                                                                         |
+| Commit only counts replicas of CURRENT-term entries                                                                                                                                                                   | Figure 8: old-term entries can be overwritten even when a majority holds them                                                        | Old entries commit indirectly via the no-op                                                                                 |
+| Follower replies with ConflictIndex so the leader skips back quickly                                                                                                                                                  | Avoids stepping back one entry per round trip                                                                                        | Slightly more logic than the paper's basic version                                                                          |
+| Randomized election timeout 300-600ms, heartbeat 75ms (defaults)                                                                                                                                                      | Avoids split votes; heartbeat much shorter than timeout                                                                              | Failover takes roughly one timeout                                                                                          |
+| Persist errors panic                                                                                                                                                                                                  | A node that cannot save its promises must not keep running                                                                           | A full disk crashes the node                                                                                                |
+| Apply callback runs on one goroutine, in order, outside the lock                                                                                                                                                      | State machine sees every committed entry exactly once, in order                                                                      | Slow Apply delays later entries                                                                                             |
+| Leader steps down if it has not heard from a majority within one minimum election timeout (check-quorum)                                                                                                              | A cut-off leader stops accepting writes and stops claiming leadership at about the time a replacement can be elected                 | A leader can step down needlessly if replies are delayed or lost for a whole timeout; the cost is just a new election       |
+| Reads use read-index (ConfirmRead): wait for a commit in the leader's own term, note the commit index, get a majority to answer a heartbeat sent AFTER the read arrived, wait for the Store to apply up to that index | Linearizable reads without writing every read into the log; does not depend on clocks                                                | Each read costs a round trip to a majority; a leader that cannot reach a majority refuses (503) instead of answering        |
+| Only replies to heartbeats built after the read count as confirmation                                                                                                                                                 | A reply to an older heartbeat only proves we led at some earlier moment                                                              | Slightly more bookkeeping (a counter on each heartbeat)                                                                     |
+| Request IDs = Client-Id + a per-client counter (Request-Id 1, 2, 3...); the cluster remembers each client's last request number and its answer                                                                        | Bounded memory, simple to explain, and a retry is recognised even by a new leader because the memory is part of the replicated state | One outstanding request per client ID; the table grows with the number of clients and never expires                         |
+| Duplicates are filtered at APPLY time, not when the request arrives                                                                                                                                                   | Apply is the one place every node sees the same requests in the same order                                                           | A retry still takes a (cheap) slot in the ledger                                                                            |
+| Request IDs are optional                                                                                                                                                                                              | Easy to use with plain curl                                                                                                          | Without them a retried write can be applied twice (a test shows this on purpose)                                            |
 
 ## Fault-injection testing (Stage 4)
 
@@ -155,7 +159,7 @@ Add `data/` to .gitignore.
 
 ## Current test results (Go 1.22.2, race detector on)
 
-- `go vet ./...` clean; `go test -race ./...`: 70 tests pass (kv: 33, raft: 37).
+- `go vet ./...` clean; `go test -race ./...`: 71 tests pass (kv: 33, raft: 38). Includes a 5-node test (survives 2 failures, refuses to commit with 3 down).
 - Repeated 8x in full and the chaos test 10x with random fault schedules: no failures, no data races.
 - Mutation check: each of these deliberate bugs makes at least one test fail: no election restriction, committing old-term entries by counting, committing without a majority, not persisting the vote, not persisting the log, accepting a stale leader's messages, truncating the log on a duplicate message.
 - Stage 3 step-down: new tests (cut-off leader steps down and refuses writes; only one leader claimed after a partition; leader with a majority keeps leading) pass. Breaking the check on purpose (never step down; step down unless hearing everyone) makes them fail. Full suite repeated 5x: no failures.
@@ -168,4 +172,100 @@ Add `data/` to .gitignore.
 
 ## Measured numbers
 
-None yet. Only numbers we actually measure get recorded here (Stage 4).
+**Rule: only numbers that `scripts/bench.sh` printed on the author's own machine go in this section.** Nothing estimated, nothing from another machine, nothing rounded up. Every table says which machine, which date, and which commit.
+
+### How to measure
+
+    bash scripts/bench.sh 3 durable      # 3 nodes, real fsync: the headline numbers
+    bash scripts/bench.sh 5 durable      # 5 nodes
+    bash scripts/bench.sh 3 nofsync      # same, with fsync OFF: shows what durability costs; never a headline number
+
+All nodes run on one machine (so no real network latency). Each run uses 100-byte values, writes carry request IDs (the exactly-once path), 10 s measured after a 2 s warm-up, at 1, 8, 32 and 128 concurrent clients. Reads are the safe kind (every read confirms leadership with a majority first). After every write run, kvbench reads back what it wrote and refuses to call the run valid if any value is wrong; it also flags a run during which the leader changed. Raw output is saved under `bench-results/`.
+
+Close other heavy programs and plug the laptop in before measuring.
+
+### Results (author's machine)
+
+Machine: Apple M3 (8 cores), macOS 26.6.2, Go 1.27.3, darwin/arm64. All nodes and the load generator on this one laptop.
+Date: 2026-11-10. Commit: _(paste `git rev-parse --short HEAD`)_.
+Every run: 0 errors, all keys read back correctly, no leader change during the run. One 10 s run per cell, so small differences are not meaningful (point 5 below shows noise of at least 12% between two runs that should match).
+Raw output: `bench-results/20261110-003538-3node-durable.txt`, `...-004525-5node-durable.txt`, `...-005025-3node-nofsync.txt`.
+
+**3 nodes, durable (real fsync): the headline numbers**
+
+| workload        | clients | ops/sec | p50 ms | p95 ms | p99 ms  | max ms  |
+| --------------- | ------- | ------- | ------ | ------ | ------- | ------- |
+| write           | 1       | 119     | 8.95   | 10.24  | 12.89   | 33.16   |
+| write           | 8       | 208     | 34.37  | 60.90  | 64.96   | 72.12   |
+| write           | 32      | 233     | 127.60 | 246.32 | 264.49  | 306.77  |
+| write           | 128     | 229     | 548.80 | 831.58 | 1047.29 | 1133.93 |
+| read            | 1       | 6774    | 0.14   | 0.16   | 0.20    | 0.44    |
+| read            | 8       | 23523   | 0.33   | 0.44   | 0.52    | 1.24    |
+| read            | 32      | 36079   | 0.88   | 1.12   | 1.41    | 3.43    |
+| read            | 128     | 40673   | 3.14   | 3.77   | 4.27    | 6.95    |
+| mixed 90% reads | 1       | 1024    | 0.37   | 6.41   | 8.46    | 15.80   |
+| mixed 90% reads | 8       | 1433    | 4.42   | 14.05  | 17.31   | 28.82   |
+| mixed 90% reads | 32      | 1685    | 17.45  | 34.09  | 54.46   | 190.84  |
+| mixed 90% reads | 128     | 2534    | 43.73  | 94.85  | 122.50  | 200.24  |
+
+**5 nodes, durable**
+
+| workload        | clients | ops/sec | p50 ms | p95 ms | p99 ms  | max ms  |
+| --------------- | ------- | ------- | ------ | ------ | ------- | ------- |
+| write           | 1       | 98      | 10.08  | 13.93  | 16.25   | 20.01   |
+| write           | 8       | 188     | 38.19  | 68.53  | 73.58   | 78.49   |
+| write           | 32      | 208     | 142.62 | 270.29 | 300.47  | 317.51  |
+| write           | 128     | 215     | 585.00 | 776.93 | 1129.41 | 1210.76 |
+| read            | 1       | 5157    | 0.19   | 0.22   | 0.28    | 13.72   |
+| read            | 8       | 17661   | 0.45   | 0.57   | 0.69    | 5.32    |
+| read            | 32      | 31054   | 1.02   | 1.28   | 1.61    | 4.01    |
+| read            | 128     | 39360   | 3.25   | 3.85   | 4.31    | 6.27    |
+| mixed 90% reads | 1       | 800     | 0.47   | 8.24   | 11.37   | 16.57   |
+| mixed 90% reads | 8       | 1152    | 5.93   | 17.10  | 21.17   | 29.70   |
+| mixed 90% reads | 32      | 1629    | 19.36  | 32.16  | 40.94   | 65.93   |
+| mixed 90% reads | 128     | 2407    | 45.21  | 102.62 | 133.42  | 240.48  |
+
+**3 nodes, fsync OFF (shows the cost of durability; unsafe, never a headline)**
+
+| workload        | clients | ops/sec | p50 ms | p95 ms | p99 ms | max ms |
+| --------------- | ------- | ------- | ------ | ------ | ------ | ------ |
+| write           | 1       | 6182    | 0.16   | 0.18   | 0.24   | 3.22   |
+| write           | 8       | 21435   | 0.37   | 0.48   | 0.56   | 8.18   |
+| write           | 32      | 32932   | 0.95   | 1.24   | 1.63   | 10.41  |
+| write           | 128     | 36576   | 3.45   | 4.16   | 5.30   | 36.01  |
+| read            | 1       | 6735    | 0.15   | 0.16   | 0.18   | 0.68   |
+| read            | 8       | 21721   | 0.36   | 0.47   | 0.55   | 15.31  |
+| read            | 32      | 32945   | 0.96   | 1.21   | 1.47   | 3.41   |
+| read            | 128     | 36424   | 3.51   | 4.16   | 4.55   | 11.39  |
+| mixed 90% reads | 1       | 6329    | 0.15   | 0.17   | 0.19   | 2.31   |
+| mixed 90% reads | 8       | 20272   | 0.39   | 0.50   | 0.59   | 3.57   |
+| mixed 90% reads | 32      | 31756   | 1.00   | 1.27   | 1.59   | 5.05   |
+| mixed 90% reads | 128     | 35232   | 3.62   | 4.33   | 4.74   | 9.96   |
+
+### What the numbers say
+
+Ratios below are arithmetic on the tables above. Explanations marked "consistent with" are inferences, not measurements.
+
+1. **Durable writes are limited to about 230 per second.** Throughput goes 119, 208, 233, 229 as clients go 1, 8, 32, 128: it stops growing at about 8 clients while median latency keeps climbing (34, 128, 549 ms). That is a queue behind one bottleneck. Check (clients should be about throughput x latency): 233 ops/s x 0.1276 s = 29.7 for 32 clients, and 229 ops/s x 0.5488 s = 125.7 for 128 clients, so the figures are self-consistent.
+2. **fsync is the cost.** With fsync off, writes reach 6182/s at 1 client and 36576/s at 128 clients, versus 119 and 229 durable: about 52x and 160x. Median single-client write latency is 8.95 ms durable versus 0.16 ms.
+3. **fsync on this machine, measured directly: 2.52 ms** per 100-byte append plus fsync (average of 200, one run, a separate small Go program, not part of this repo). A single write has two flushes in a row (the leader's, then a follower's), about 5.05 ms of the 8.95 ms median (56%). The other roughly 3.9 ms is NOT explained by fsync and has not been measured (candidates: HTTP and JSON handling, goroutine scheduling, waiting for the node's lock).
+   The ceiling is also not explained by fsync alone: 233 writes/s is one write per 4.3 ms, but one 2.52 ms flush per write would allow about 396 writes/s, so the ceiling is 59% of that. Something else that runs one at a time costs about 1.8 ms per write. A guess, not a finding: the leader holds its lock while flushing, and the goroutines that send entries and handle replies need the same lock.
+4. **Reads are far cheaper than writes.** At 1 client: 0.14 ms median versus 8.95 ms (about 64x). At 128 clients: 40673 reads/s versus 229 writes/s. Reads do no disk write, only a round trip to a majority.
+5. **Read speed is the same with and without fsync** (40673 vs 36424 at 128 clients). The durable run was actually 12% HIGHER, which fsync cannot cause, so that gap shows run-to-run noise of at least that size. That is what you expect when reads never write to disk.
+6. **A 10% write mix is capped by write speed.** At 128 clients the mix did 2534 ops/s; 10% of that is about 253 writes/s, close to the pure-write ceiling of 229. Even a small share of writes pulls total throughput from about 40000 down to about 2500.
+7. **5 nodes were slower than 3 in all 12 durable cells** (4 client levels x write, read, mixed): writes by 6% to 18% (98 vs 119, 188 vs 208, 208 vs 233, 215 vs 229 ops/s at 1, 8, 32, 128 clients), reads by 3% to 25%, mixed by 3% to 22%. The direction is consistent; the sizes are uncertain with one run each, and point 5 shows noise of 12% or more is possible. Plausible causes (not measured): more followers to wait for and more messages competing for the same CPU and disk.
+8. **Tail latency for durable writes**: p99 is 1.4x the median at 1 client and about 1.9x to 2.1x at 8 or more clients (for example 264 ms vs 128 ms at 32 clients). The slowest request was about 2.1x the median at 128 clients.
+
+### Predictions versus results
+
+- Writes limited by disk flushes, plateauing at modest concurrency: **partly confirmed**. The plateau and the 52x to 160x cost of fsync are confirmed (points 1 and 2); but my explanation of the exact figures was wrong: I predicted 4 to 5 ms per flush, the measured flush is 2.52 ms, so fsync accounts for only part of the write latency and ceiling (point 3).
+- Reads faster than writes: **confirmed**, by far more than expected (point 4).
+- 5 nodes write a little slower than 3: **consistent**, 6% to 18% lower (point 7).
+
+### Known limits of these measurements
+
+All nodes share one machine, one disk and one CPU, so they compete with each other and with the load generator. There is no real network between nodes. One 10 s run per cell, no repeats, so small differences (under about 10%) may be noise. Numbers describe this laptop, not a production cluster. fsync time was measured once with a separate 200-iteration program (2.52 ms), not inside the server. Stage 6 repeats the runs on Kubernetes.
+
+### Ideas the numbers point to (not done)
+
+Group commit: save several waiting writes to disk with one fsync instead of one fsync per write. It should help, but point 3 shows fsync does not explain the whole ceiling, so the gain is unknown. Profile first (Go's pprof) to see where the time goes, and cut lock hold times if the lock is the problem. Any code change means repeating the runs.
